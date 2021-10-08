@@ -1,0 +1,2375 @@
+--- 10_CUL_HM.svn.pm	2021-09-12 15:56:01.658104447 +0200
++++ 10_CUL_HM.pm	2021-10-07 21:33:38.289329865 +0200
+@@ -1,7 +1,7 @@
+ ##############################################
+ ##############################################
+ # CUL HomeMatic handler
+-# $Id: 10_CUL_HM.pm 24961 2021-09-12 06:46:07Z martinp876 $
++# $Id: 10_CUL_HM.pm 24961 2021-10-07 + various Beta-User+frank-Patches + sort II + new initialisation + allow more set commands in startup phase + start before HMinfo  $
+ 
+ package main;
+ 
+@@ -209,12 +209,16 @@
+   $hash->{helper}{primary} = ""; # primary is one device in CUL_HM.It will be used for module notification. 
+                                           # fhem does not provide module notifcation - so we streamline here. 
+   $hash->{helper}{initDone} = 0;
++  $hash->{NotifyOrderPrefix} = "48-"; #Beta-User: make sure, CUL_HM is up and running prior to User code e.g. in notify, and also prior to HMinfo
++  InternalTimer(1,"CUL_HM_updateConfig","startUp",0);
++  #InternalTimer(1,"CUL_HM_setupHMLAN", "initHMLAN", 0);#start asap once FHEM is operational
++  return;
+ }
+ 
+ sub CUL_HM_updateConfig($){##########################
+   my $type = shift;
+-  # this routine is called 5 sec after the last define of a restart
+-  # this gives FHEM sufficient time to fill in attributes
++  # this routine is called immedately after INITALIZED or REREADCFG 
++  # so all attributes and stateFile content has been read.
+   # it will also be called after each manual definition
+   # Purpose is to parse attributes and read config
+   RemoveInternalTimer("updateConfig");
+@@ -227,6 +231,13 @@
+     Log 1,"CUL_HM start inital cleanup";
+     $mIdReverse = 1 if (scalar keys %{$culHmModel2Id});
+     my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
++    
++    for (@hmdev){
++      delete $attr{$_}{IODev} if AttrVal($?,'IOgrp','') ne '' && defined $attr{$_}{IODev}; #Beta-User: might fix https://forum.fhem.de/index.php/topic,123257.msg1178337.html#msg1178337
++      CUL_HM_Attr('set',$_,'IOList',AttrVal($_,'IOList','')) if AttrVal($_,'IOList',undef); #Beta-User: Fix missing io->ioList in VCCU at startup, https://forum.fhem.de/index.php/topic,122848.msg1174047.html#msg1174047
++      #Beta-User: might have to be executed again after startup?
++    }
++    
+     foreach my $name  (@hmdev){
+       if ($attr{$name}{subType} && $attr{$name}{subType} eq "virtual"){
+         $attr{$name}{model} = "VIRTUAL" if (!$attr{$name}{model} || $attr{$name}{model} =~ m/virtual_/);
+@@ -241,7 +252,7 @@
+       }
+       CUL_HM_updtDeviceModel($name,AttrVal($name,"modelForce",AttrVal($name,"model","")),1) if($attr{$name}{".mId"});
+       # update IOdev
+-      CUL_HM_Attr("set",$name,"IOgrp",AttrVal($name,"IOgrp","")) if(AttrVal($name,"IOgrp","") ne "");# update helper by set attr again
++      CUL_HM_Attr("set",$name,"IOgrp",AttrVal($name,"IOgrp","")) if(AttrVal($name,"IOgrp","") ne "");# update helper by set attr again #Beta-User: might be to early in first notify loop?
+       my $h = $defs{$name};
+       delete $h->{helper}{io}{restoredIO} if (   defined($h->{helper}{io})
+                                               && defined($h->{helper}{io}{restoredIO})
+@@ -308,7 +319,7 @@
+       # move certain attributes to readings for future handling
+       my $aName = $rName;
+       $aName =~ s/D-//;
+-      my $aVal = AttrVal($name,$aName,undef);      
++      my $aVal = AttrVal($name,$aName,undef);
+       CUL_HM_UpdtReadSingle($hash,$rName,$aVal,0)
+            if (!defined ReadingsVal($name,$rName,undef) && defined($aVal));
+     }
+@@ -406,19 +417,32 @@
+     }
+     elsif ($st eq "virtual" ) {#setup virtuals
+       $hash->{helper}{role}{vrt} = 1;
++      #if (AttrVal($name,'peerIDs',undef) && !keys %{$defs{$name}{helper}{peerIDsH}}) {
++      #  CUL_HM_ID2PeerList($name,$_,1) for ('peerUnread',split q{,},AttrVal($name,'peerIDs',''));
++      #} #Beta-User: Might not have been called earlier. Then subtype is unknown yet, https://forum.fhem.de/index.php/topic,123136.msg1177303.html#msg1177303;
+       if (   $hash->{helper}{fkt} 
+           && $hash->{helper}{fkt} =~ m/^(vdCtrl|virtThSens)$/){
+         my $vId = substr($id."01",0,8);
+-        $hash->{helper}{vd}{msgRed}= 0 if(!defined $hash->{helper}{vd}{msgRed});
++        if (!defined $hash->{helper}{vd}{msgRed}) {
++            $hash->{helper}{vd}{msgRed}=0;
++            my $attrVal = AttrVal($name,'param','');
++            if ($attrVal =~ m/msgReduce/) {
++                my (undef,$rCnt) = split(":",$attrVal,2);
++                $rCnt=(defined $rCnt && $rCnt =~ m/^\d$/)?$rCnt:1;
++                $hash->{helper}{vd}{msgRed}=$rCnt;
++            }
++        }
+         if(!defined $hash->{helper}{vd}{next}){
+           ($hash->{helper}{vd}{msgCnt},$hash->{helper}{vd}{next}) = 
+                     split(";",ReadingsVal($name,".next","0;".gettimeofday()));
+           $hash->{helper}{vd}{idl} = 0;
+           $hash->{helper}{vd}{idh} = 0;
+         }
++        InternalTimer(time+10,'CUL_HM_initializeVirtuals', $hash,0); #Beta-User: make sure, CUL_HM is in toto up and running befor other devices want to use them, 
++=pod
+         if ($hash->{helper}{fkt} eq "vdCtrl"){
+-          my $d = ReadingsVal($name,"valvePosTC","");
+-          $d =~ s/ %//;
++          my $d = ReadingsNum($name,'valvePosTC','50');
++                   Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
+           CUL_HM_Set($hash,$name,"valvePos",$d);
+           CUL_HM_UpdtReadSingle($hash,"valveCtrl","restart",1) if ($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+           RemoveInternalTimer("valvePos:$vId");
+@@ -426,11 +450,13 @@
+           InternalTimer($hash->{helper}{vd}{next},"CUL_HM_valvePosUpdt","valvePos:$vId",0);
+         }
+         elsif($hash->{helper}{fkt} eq "virtThSens"){
+-          my $d = ReadingsVal($name,"temperature","");
++                   Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++          my $d = ReadingsNum($name,'temperature','20');
+           CUL_HM_Set($hash,$name,"virtTemp",$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+           $d = ReadingsVal($name,"humidity","");
+           CUL_HM_Set($hash,$name,"virtHum" ,$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+         }
++=cut
+ 
+         # delete - virtuals dont have regs 
+         delete $attr{$name}{$_} foreach ("autoReadReg","actCycle","actStatus","burstAccess","serialNr"); 
+@@ -517,11 +543,10 @@
+     }
+     $attr{$name}{webCmd} = $webCmd if ($webCmd);
+ 
+-    CUL_HM_SetList($name,"") if (!defined $defs{$name}{helper}{cmds}{cmdLst});
+     #remove invalid attributes. After set commands fot templist
+     CUL_HM_Attr("set",$name,"peerIDs",$attr{$name}{peerIDs}) if (defined $attr{$name}{peerIDs});# set attr again to update namings
+-    foreach(keys %{$attr{$name}}){
+-      delete $attr{$name}{$_} if (CUL_HM_AttrCheck('set',$name,$_,$attr{$name}{$_}));  
++    foreach(sort keys %{$attr{$name}}){
++      delete $attr{$name}{$_} if (CUL_HM_AttrCheck($name,'set',$_,$attr{$name}{$_}));  #Beta-User: fixes missing tempListTmpl, see also noansi => https://forum.fhem.de/index.php/topic,122107.msg1166930.html#msg1166930
+     }
+     CUL_HM_qStateUpdatIfEnab($name) if($hash->{helper}{role}{dev});
+     next if (0 == (0x07 & CUL_HM_getAttrInt($name,"autoReadReg")));
+@@ -548,6 +573,29 @@
+   ## configCheck will be issues by HMInfo once
+ }
+ 
++sub CUL_HM_initializeVirtuals {
++    my $hash = shift // return;
++    my $name = $hash->{NAME} // return;
++    my $vId = substr($hash->{DEF}."01",0,8);
++    if ($hash->{helper}{fkt} eq "vdCtrl"){
++        my $d = ReadingsNum($name,'valvePosTC','50');
++                   #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++        CUL_HM_Set($hash,$name,"valvePos",$d);
++        CUL_HM_UpdtReadSingle($hash,"valveCtrl","restart",1) if ($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++        RemoveInternalTimer("valvePos:$vId");
++        RemoveInternalTimer("valveTmr:$vId");
++        InternalTimer($hash->{helper}{vd}{next},"CUL_HM_valvePosUpdt","valvePos:$vId",0);
++    }
++    elsif($hash->{helper}{fkt} eq "virtThSens"){
++               #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++        my $d = ReadingsNum($name,'temperature','');
++        CUL_HM_Set($hash,$name,"virtTemp",$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++        $d = ReadingsNum($name,"humidity","");
++        CUL_HM_Set($hash,$name,"virtHum" ,$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++    }
++    return;
++}
++
+ sub CUL_HM_primaryDev() {###########################
+   # one - and only one  - CUL_HM entity will be primary device
+   # primary device is a) CUL_HM and b) not ignored
+@@ -648,6 +696,7 @@
+   
+   $modules{CUL_HM}{defptr}{$HMid} = $hash;
+   notifyRegexpChanged($hash,"",1);# no notification required for this device
++  CUL_HM_primaryDev() if devspec2array('TYPE=CUL_HM') == 2; #Beta-User: we need at least one entity to initialize startup procedure
+ 
+   #- - - - create auto-update - - - - - -
+   CUL_HM_ActGetCreateHash() if($HMid eq '000000');#startTimer
+@@ -905,6 +954,8 @@
+         $attr{$name}{subType} = "virtual";
+         $attr{$name}{".mId"} = CUL_HM_getmIdFromModel($attrVal);
+         $updtReq = 1;
++        #Beta-User# sonst braucht man nach dem define einen Neustart?
++        CUL_HM_AttrAssign($name);
+         CUL_HM_UpdtCentral($name);
+     }
+     else{
+@@ -977,7 +1028,8 @@
+       return 'CUL_HM '.$name.': IOgpr set => ccu to control the IO. Delete attr IOgrp if unwanted'
+              if (AttrVal($name,"IOgrp",undef));
+       if ($attrVal) {
+-        my @IOnames = devspec2array("Clients=:CUL_HM:");        
++        #Beta-User: Original ist zu eng, liefert bei CUL&Co keine Treffer. Oder beabsichtigt? https://forum.fhem.de/index.php/topic,122848.msg1173977.html#msg1173977
++        my @IOnames = devspec2array('Clients=.*:CUL_HM:.*');
+         return 'CUL_HM '.$name.': Non suitable IODev '.$attrVal.' specified. Options are: ',join(",",@IOnames)
+             if (!grep /^$attrVal$/,@IOnames);
+         $attr{$name}{$attrName} = $attrVal;
+@@ -1058,11 +1110,13 @@
+       return "vccu $ioCCU is no vccu with IOs assigned. It can't be used as IO" if (!$ioLst);# implicitely checks also for correct vccu
+       my @prefIOarr;
+       if ($prefIO){
+-        my @ioOpts = split(",",AttrVal($ioCCU,"IOList",""));
++        my @ioOpts = split(",",$ioLst);
+         return "$ioCCU not a valid CCU with IOs assigned" if (!scalar @ioOpts);
++        push @ioOpts, 'none'; #Beta-User: Might fix #2 from https://forum.fhem.de/index.php/topic,123238.msg1178193.html#msg1178193
+         @prefIOarr = split(",",$prefIO);
+         foreach my $pIO (@prefIOarr){
+-          return "$pIO is not part if VCCU IOs:$ioLst".join(",",@ioOpts) if(1 != grep/$pIO/,@ioOpts);
++          return "$pIO is not an allowed value for preferred IO list. Leave unassigned or choose one or more of ".join(",",@ioOpts) if(1 != grep m{\A$pIO\z},@ioOpts);
++          return "'none' may not be used without precedent other IO and has to be last!" if $prefIO eq 'none' || $prefIO =~ m{\bnone[\b]*.+\z};
+         }
+       }
+       else{
+@@ -1262,10 +1316,13 @@
+   $defs{$name}{'.AttrList'} =~ m/ ?($attrName)(:*)(.*?) /;
+   my ($attrFound,$attrOpt)  = ($1,$3);
+ #  return "$attrName not defined for $name" if (!defined $attrFound); # must not occure - already checked global
+-  return undef if (!$attrOpt || $attrOpt =~ m/^multiple/); # any value allowed
++  #Beta-User: fixes https://forum.fhem.de/index.php/topic,122423.0.html
++  return undef if (!$attrOpt || $attrOpt =~ m/^multiple|textField-/); # any value allowed
+   return undef if(grep/^$attrVal$/,split(",",$attrOpt));   # attrval is valid option
++  #return undef if $attrFound && $attrName eq 'param'; #Beta-User: might "repair" https://forum.fhem.de/index.php/topic,123136.msg1178013.html#msg1178013
++  #return undef if $attrFound && $attrName eq 'tempListTmpl'; #Beta-User: would "repair"  https://forum.fhem.de/index.php/topic,122726.msg1177787.html#msg1177787 - but not helpful, as HMinfo will only use the central file if set!
+   
+-  return "value $attrVal illegal. Choose one of:$attrOpt";
++  return "value $attrVal not allowed. Choose one of:$attrOpt";
+ }
+ sub CUL_HM_AttrInit($;$) {#############################
+   # define attributes and their options that are relevant/defined/controlled by CUL_HM
+@@ -1328,7 +1385,7 @@
+                           };
+     $hash->{AttrX}{VIRTUAL} = {                        # model = virtual ###=> virtual {helper}{fkt} eq "vdCtrl" for VD
+                            cyclicMsgOffset   => ''
+-                          ,param             => '' 
++                          ,param             => ''
+                           };
+ 
+     $hash->{AttrX}{'blindActuator'} = {                # subType
+@@ -1381,13 +1438,13 @@
+         $hash->{ModulAttr}{$atDef}{$atTyp} = 1;
+       }
+     }
+-    $hash->{AttrList} = join(" ",sort 
+-                                 map{my ($foo) = keys %{$hash->{ModulAttr}{$_}}; # use first option
++    $hash->{AttrList} = join(" ",sort #Beta-User: double sorting in map and noDup seems to bind empty preselection for param to VIRTUAL channel (textfield); https://forum.fhem.de/index.php/topic,123136.msg1177100.html#msg1177100
++                                 map{my ($foo) = sort keys %{$hash->{ModulAttr}{$_}}; # use first option
+                                        my $val = $hash->{AttrX}{$foo}{$_};
+                                        $_.($val ? ':'.$val                         # add colon
+                                                 : '')
+                                       }    
+-                                 CUL_HM_noDup(keys %{$hash->{ModulAttr}})         # each attr just once
++                                 CUL_HM_noDup(sort keys %{$hash->{ModulAttr}})         # each attr just once
+                              );
+   }
+   # update dependant
+@@ -1401,6 +1458,7 @@
+   }
+   return;
+ }
++
+ sub CUL_HM_AttrAssign($) {###########################
+   #define the list of valid attributes per entity
+   #remove attributes that are illegal
+@@ -1408,6 +1466,7 @@
+   my $entH = $defs{$name};
+   my $modH = $modules{CUL_HM};
+   return undef if (!$init_done); # we cannot determine now. if attributes are missing
++  #CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq "" || $defs{$name}->{helper}{cmds}{TmplKey} eq "" || !defined $defs{$name}{helper}{cmds}{cmdList});
+   my   @attrGrp = ('glb'); # global for all CUL_HM
+   push @attrGrp,'dev'         if ($entH->{helper}{role}{dev});
+   push @attrGrp,'devPhy'      if ($entH->{helper}{role}{dev} && !$entH->{helper}{role}{vrt});
+@@ -1529,7 +1588,8 @@
+                  );# no notification about myself
+   my $events = $dev->{CHANGED};
+   return undef if(!$events); # Some previous notify deleted the array.
+-  my $cws = join(";#",@{$dev->{CHANGED}});
++  #my $cws = join(";#",@{$dev->{CHANGED}});
++  my $count; #Beta-User: Bessere Rückmeldung beim Umbenennen, https://forum.fhem.de/index.php/topic,122552.0.html
+   foreach my $evnt(@{$events}){
+     if($evnt =~ m/^(DELETEATTR)/){
+     }
+@@ -1539,6 +1599,7 @@
+         if ($ent eq $modules{CUL_HM}{helper}{primary}){
+           $modules{CUL_HM}{helper}{primary} = ""; # force rescan  
+           CUL_HM_primaryDev();
++          $count++;
+         }
+       }
+     }
+@@ -1550,6 +1611,7 @@
+         ||($evnt eq "RENAMED" && $defs{$new}{TYPE} eq "CUL_HM")){
+         CUL_HM_Rename($new,$ent) if($evnt eq "RENAMED");
+         CUL_HM_primaryDev() if ($ent eq $modules{CUL_HM}{helper}{primary});
++        $count++;
+       }
+       else{##------- update dependancies to IO devices used
+         my @culHmDevs = grep{$defs{$_}{DEF} =~ m/^......$/} grep{$defs{$_}{TYPE} eq "CUL_HM"} keys %defs;
+@@ -1567,21 +1629,44 @@
+                      split(",",$ios)
+                      );
+               $attr{$HMdef}{IOgrp} = "$vccu:$ios";
++              $count++;
+             }
+             else {# the vccu has no IO anymore - delete clients
+               CommandDeleteAttr (undef,"$HMdef IOgrp") ; 
++              $count++;
+             }
+           }
+-          CommandAttr (undef,"$vccu IOList $ea")if ($ea ne $eaOld);
++          if ($ea ne $eaOld) {
++            CommandAttr (undef,"$vccu IOList $ea");
++            $count++;
++          }
+         }
+         foreach my $HMdef (grep{AttrVal($_,"IODev","") eq $ent} @culHmDevs){# for each IODev
+           CommandAttr (undef,"$HMdef IODev $new");
++          $count++;
+         }
+       }
+-      return "CUL_HM renamed a lot";
++      return "CUL_HM: $count device(s) renamed or attributes changed due to DELETED or RENAMED event" if $count;
++      return;
+     }
+-    elsif (!$modules{CUL_HM}{helper}{initDone} &&  $evnt =~ m/INITIALIZED/){# grep the first initialize
++    elsif (!$modules{CUL_HM}{helper}{initDone} && $evnt =~ m/INITIALIZED|REREADCFG/){# grep the first initialize
++      #Beta-User: Perform HMinfo configCheck if possible, first for real Devices, then for VIRTUALs
++      #Log3(undef,3,"debug: CUL_HM event $evnt");
+       CUL_HM_updateConfig("startUp");
++=pod      
++      my ($hm) = devspec2array("TYPE=HMinfo");
++      if ( defined $hm ) {
++        my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
++        for (@hmdev){   
++          next if AttrVal($_,'model','') =~ m{virtual}i;
++          HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($_),$_)).")\$");
++        }
++        for (@hmdev){
++          next if AttrVal($_,'model','') !~ m{virtual}i;
++          HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($_),$_)).")\$");
++        }
++      }
++=cut
+       InternalTimer(1,"CUL_HM_setupHMLAN", "initHMLAN", 0);#start asap once FHEM is operational
+     }
+ #    elsif($evnt =~ m/(DEFINED)/  ){ Log 1,"Info --- $dev->{NAME} -->$ntfy->{NAME} :  $evnt";}
+@@ -4289,6 +4374,7 @@
+   RemoveInternalTimer("updateConfig");
+   InternalTimer(gettimeofday()+5,"CUL_HM_updateConfig", "updateConfig", 0);
+ }
++
+ sub CUL_HM_parseSDteam(@){#handle SD team events
+   my ($mTp,$sId,$dId,$p) = @_;
+   
+@@ -4383,7 +4469,7 @@
+   if ($sVal > 179 ||$sVal <51 ){# need to raise alarm
+     if ($sVal > 179){# need to raise alarm
+       #"SHORT_COND_VALUE_LO" value="50"/>
+-	  #"SHORT_COND_VALUE_HI" value="180"/>
++      #"SHORT_COND_VALUE_HI" value="180"/>
+       $sProsa = "smoke-Alarm_".$No;
+       $smokeSrc = $dName;
+       push @evtEt,[$sHash,1,"recentAlarm:$smokeSrc"] if($sVal == 200);
+@@ -4617,7 +4703,7 @@
+     }
+     else{
+       my $regVal = CUL_HM_getRegFromStore($name,$regReq,$list,$peerId);
+-	  $regVal =~ s/ .*// if ($cmd eq "regVal");
++      $regVal =~ s/ .*// if ($cmd eq "regVal");
+       return ($regVal =~ m/^invalid/)? "Value not captured:$name - $regReq"
+                                      : $regVal;
+     }
+@@ -4765,6 +4851,7 @@
+                keys %defs;
+       my @rl;
+       foreach (@dl){
++        next if IsIgnored($_) || IsDummy($_); #frank: https://forum.fhem.de/index.php/topic,123238.msg1178193.html#msg1178193
+         my(undef,$pref) = split":",$attr{$_}{IOgrp},2;
+         $pref =  "---" if (!$pref);
+         my $IODev = $defs{$_}{IODev}->{NAME}?$defs{$_}{IODev}->{NAME}:"---";
+@@ -4874,7 +4961,7 @@
+ }
+ sub CUL_HM_SetList($$) {#+++++++++++++++++ get command basic list++++++++++++++
+   my($name,$cmdKey)=@_;
+-  my $hash = $defs{$name};
++  my $hash = $defs{$name} // return; #Beta-User: workaround for uninitialized-Problem mentionned in https://forum.fhem.de/index.php/topic,123257.msg1178290.html#msg1178290
+   
+   if(!$cmdKey){
+     my $devName = InternalVal($name,"device",$name);
+@@ -4902,24 +4989,24 @@
+       }
+     }
+     
+-    if( !$roleV &&($roleD || $roleC)        ){push @arr1,map{"$_:".$culHmGlobalSets->{$_}            }keys %{$culHmGlobalSets}           };
+-    if(( $roleV||!$st||$st eq "no")&& $roleD){push @arr1,map{"$_:".$culHmGlobalSetsVrtDev->{$_}      }keys %{$culHmGlobalSetsVrtDev}     };
+-    if( !$roleV                    && $roleD){push @arr1,map{"$_:".${$culHmSubTypeDevSets->{$st}}{$_}}keys %{$culHmSubTypeDevSets->{$st}}};
+-    if( !$roleV                    && $roleC){push @arr1,map{"$_:".$culHmGlobalSetsChn->{$_}         }keys %{$culHmGlobalSetsChn}        };
+-    if( $culHmSubTypeSets->{$st}   && $roleC){push @arr1,map{"$_:".${$culHmSubTypeSets->{$st}}{$_}   }keys %{$culHmSubTypeSets->{$st}}   };
+-    if( $culHmModelSets->{$md})              {push @arr1,map{"$_:".${$culHmModelSets->{$md}}{$_}     }keys %{$culHmModelSets->{$md}}     };
+-    if( $culHmChanSets->{$md."00"} && $roleD){push @arr1,map{"$_:".${$culHmChanSets->{$md."00"}}{$_} }keys %{$culHmChanSets->{$md."00"}} };
+-    if( $culHmChanSets->{$md."xx"} && $roleC){push @arr1,map{"$_:".${$culHmChanSets->{$md."xx"}}{$_} }keys %{$culHmChanSets->{$md."xx"}} };
+-    if( $culHmChanSets->{$md.$chn} && $roleC){push @arr1,map{"$_:".${$culHmChanSets->{$md.$chn}}{$_} }keys %{$culHmChanSets->{$md.$chn}} };
+-    if( $culHmFunctSets->{$fkt}    && $roleC){push @arr1,map{"$_:".${$culHmFunctSets->{$fkt}}{$_}    }keys %{$culHmFunctSets->{$fkt}}    };
++    if( !$roleV &&($roleD || $roleC)        ){push @arr1,map{"$_:".$culHmGlobalSets->{$_}            } sort keys %{$culHmGlobalSets}           };
++    if(( $roleV||!$st||$st eq "no")&& $roleD){push @arr1,map{"$_:".$culHmGlobalSetsVrtDev->{$_}      } sort keys %{$culHmGlobalSetsVrtDev}     };
++    if( !$roleV                    && $roleD){push @arr1,map{"$_:".${$culHmSubTypeDevSets->{$st}}{$_}} sort keys %{$culHmSubTypeDevSets->{$st}}}; #Beta-User: sorting keys avoids erratic behaviour wrt. to setters and e.g. tempListTmpl attribute, see https://forum.fhem.de/index.php/topic,122422.msg1176621.html#msg1176621
++    if( !$roleV                    && $roleC){push @arr1,map{"$_:".$culHmGlobalSetsChn->{$_}         } sort keys %{$culHmGlobalSetsChn}        };
++    if( $culHmSubTypeSets->{$st}   && $roleC){push @arr1,map{"$_:".${$culHmSubTypeSets->{$st}}{$_}   } sort keys %{$culHmSubTypeSets->{$st}}   };
++    if( $culHmModelSets->{$md})              {push @arr1,map{"$_:".${$culHmModelSets->{$md}}{$_}     } sort keys %{$culHmModelSets->{$md}}     };
++    if( $culHmChanSets->{$md."00"} && $roleD){push @arr1,map{"$_:".${$culHmChanSets->{$md."00"}}{$_} } sort keys %{$culHmChanSets->{$md."00"}} };
++    if( $culHmChanSets->{$md."xx"} && $roleC){push @arr1,map{"$_:".${$culHmChanSets->{$md."xx"}}{$_} } sort keys %{$culHmChanSets->{$md."xx"}} };
++    if( $culHmChanSets->{$md.$chn} && $roleC){push @arr1,map{"$_:".${$culHmChanSets->{$md.$chn}}{$_} } sort keys %{$culHmChanSets->{$md.$chn}} };
++    if( $culHmFunctSets->{$fkt}    && $roleC){push @arr1,map{"$_:".${$culHmFunctSets->{$fkt}}{$_}    } sort keys %{$culHmFunctSets->{$fkt}}    };
+ 
+     $hash->{helper}{cmds}{lst}{peerOpt} = CUL_HM_getPeerOption($name);
+     push @arr1,"peerSmart:-peerOpt-" if ($hash->{helper}{cmds}{lst}{peerOpt}); 
+    
+     my @cond = ();
+-    push @cond,map{$lvlStr{md}{$md}{$_}}         keys%{$lvlStr{md}{$md}}         if (defined $lvlStr{md}{$md});
+-    push @cond,map{$lvlStr{mdCh}{"$md$chn"}{$_}} keys%{$lvlStr{mdCh}{"$md$chn"}} if (defined $lvlStr{mdCh}{"$md$chn"});
+-    push @cond,map{$lvlStr{st}{$st}{$_}}         keys%{$lvlStr{st}{$st}}         if (defined $lvlStr{st}{$st});
++    push @cond,map{$lvlStr{md}{$md}{$_}}         sort keys%{$lvlStr{md}{$md}}         if (defined $lvlStr{md}{$md});
++    push @cond,map{$lvlStr{mdCh}{"$md$chn"}{$_}} sort keys%{$lvlStr{mdCh}{"$md$chn"}} if (defined $lvlStr{mdCh}{"$md$chn"});
++    push @cond,map{$lvlStr{st}{$st}{$_}}         sort keys%{$lvlStr{st}{$st}}         if (defined $lvlStr{st}{$st});
+     push @cond,"slider,0,1,255" if (!scalar @cond);
+     $hash->{helper}{cmds}{lst}{condition} = join(",",sort grep /./,@cond);
+ 
+@@ -4987,13 +5074,13 @@
+ 
+   return;
+ }
++
+ sub CUL_HM_SearchCmd($$) {#+++++++++++++++++ is command supported?+++++++++++++
+   my($name,$findCmd)=@_;
+-  CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq "");
++  CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq ""); # || $defs{$name}->{helper}{cmds}{TmplKey} eq "" || !defined $defs{$name}{helper}{cmds}{cmdList});
+   return defined $defs{$name}{helper}{cmds}{cmdLst}{$findCmd} ? 1 : 0;
+ }
+ 
+-
+ sub CUL_HM_Set($@) {#+++++++++++++++++ set command+++++++++++++++++++++++++++++
+   my ($hash, @a) = @_;
+ #  my $T0 = gettimeofday();
+@@ -5199,7 +5286,7 @@
+     foreach my $sect (@sectL){
+       if   ($sect eq "readings"){
+         my @cH = ($hash);
+-        push @cH,$defs{$hash->{$_}} foreach(grep /^channel/,keys %{$hash});
++        push @cH,$defs{$hash->{$_}} foreach(grep /^channel/,sort keys %{$hash});
+         delete $_->{READINGS} foreach (@cH);
+         delete $modules{CUL_HM}{helper}{cfgCmpl}{$name};
+         CUL_HM_complConfig($_->{NAME}) foreach (@cH);
+@@ -5214,7 +5301,7 @@
+       }
+       elsif($sect eq "register"){
+         my @cH = ($hash);
+-        push @cH,$defs{$hash->{$_}} foreach(grep /^channel/,keys %{$hash});
++        push @cH,$defs{$hash->{$_}} foreach(grep /^channel/,sort keys %{$hash});
+       
+         foreach my $h(@cH){
+           delete $h->{READINGS}{$_}
+@@ -5294,6 +5381,7 @@
+     if ($result){
+       return $result;
+     }
++    $hash->{device} = $newName; #Beta-User: for deviceRename see https://forum.fhem.de/index.php/topic,123131.0.html
+  
+     if ($roleV){
+       foreach(1..50){
+@@ -5315,12 +5403,18 @@
+       }
+     }
+     my @results;
+-    foreach my $cd (grep /^channel_/,keys %{$hash}){
++    my @renamed;
++    foreach my $cd (grep /^channel_/,sort keys %{$hash}){
+       my $cName = InternalVal($newName,$cd,"");
+       my $no = hex(substr($cd,8));
+       $result = CommandRename(undef,$cName.' '.$chLst[$no]);
++      $hash->{"channel_".sprintf "%02X",$no} = $chLst[$no];     #reference in device as well
++      $defs{$chLst[$no]}->{device} = $newName;
++      push @renamed, $chLst[$no];
+       push @results,"rename $cName failed: $result" if ($result);
+     }
++    CUL_HM_setAssotiat($newName);
++    for (@renamed) { CUL_HM_setAssotiat($_); }
+     return "channel rename failed:\n".join("\n",@results) if (scalar @results);
+   }
+   elsif($cmd eq "tempListTmpl") { #############################################
+@@ -5337,8 +5431,10 @@
+     }
+     ($fn,$template) = split(":",($template?$template
+                                           :AttrVal($name,"tempListTmpl",$name)));
+-    if ($modules{HMinfo}){
+-      if (!$template){ $template = HMinfo_tempListDefFn()   .":$fn"      ;}
++    #if ($modules{HMinfo}){
++    #Beta-User: prevent crash, wenn no HMinfo device is defined
++    if (defined &HMinfo_tempListDefFn){
++       if (!$template){ $template = HMinfo_tempListDefFn()   .":$fn"      ;}
+       else{            $template = HMinfo_tempListDefFn($fn).":$template";}
+     }
+     else{
+@@ -5350,8 +5446,8 @@
+     return $ret;
+   }
+   elsif($cmd eq "tempTmplSet") { ##############################################
+-	return "template missing" if (!defined $a[2]);
+-	my $reply = CommandAttr(undef, "$name tempListTmpl $a[2]");
++    return "template missing" if (!defined $a[2]);
++    my $reply = CommandAttr(undef, "$name tempListTmpl $a[2]");
+     
+     my ($fn,$template) = split(":",AttrVal($name,"tempListTmpl",$name));
+     if ($modules{HMinfo}){
+@@ -5365,7 +5461,7 @@
+     CUL_HM_tempListTmpl($name,"restore",$template);
+   }
+   elsif($cmd eq "tplDel") { ###################################################
+-	return "template missing" if (!defined $a[2]);
++    return "template missing" if (!defined $a[2]);
+     my ($p,$t) = split(">",$a[2]);
+     HMinfo_templateDel($name,$t,$p) if (eval "defined(&HMinfo_templateDel)");
+     return;
+@@ -5723,7 +5819,7 @@
+       $cName =~ s/_chn-\d\d$//;
+       my $curVal = CUL_HM_getRegFromStore($cName,$addr,$list,$peerId.$peerChn);
+       if ($curVal !~ m/^(set_|)(\d+)$/){
+-	    return "peer required for $regName" if ($curVal =~ m/peer/);
++        return "peer required for $regName" if ($curVal =~ m/peer/);
+         return "cannot calculate value. Please issue set $name getConfig first - $curVal";
+       }
+       $curVal = $2; # we expect one byte in int, strap 'set_' possibly
+@@ -7639,6 +7735,7 @@
+                               ".D-devInfo:$devInfo",
+                               ".D-stc:$stc");
+ }
++
+ sub CUL_HM_updtDeviceModel($$@) {#change the model for a device - obey overwrite modelForce
+   my($name,$model,$fromUpdate) = @_;
+   my $hash = $defs{$name};
+@@ -7647,14 +7744,26 @@
+   delete $hash->{helper}{rxType};
+   CUL_HM_getRxType($hash); #will update rxType
+   my $mId = CUL_HM_getMId($hash);# set helper valiable and use result
+-  return if(!defined $mId or $mId eq "");
++  return if(!defined $mId or $mId eq "" or $mId eq "none");
+   # autocreate undefined channels
+   my %chanExist;
+   %chanExist = map { $_ => 0 } CUL_HM_getAssChnIds($name);
+   if ($attr{$name}{subType} eq "virtual"){# do not apply all possible channels for virtual
+-    $attr{CUL_HM_id2Name($_)}{model} = $model foreach(keys %chanExist);
++    for my $chanid (keys %chanExist) {
++        my $chann = CUL_HM_id2Name($chanid);
++        next if !defined $defs{$chann}; #special for ACTIONDETECTOR. Or use "next if ($chanExist{$_} == 1);"
++        $attr{$chann}{model} = $model; #Beta-User: or 'VIRTUAL'?
++        if ( $fromUpdate && AttrVal($chann,'peerIDs',undef) && !keys %{$defs{$chann}{helper}{peerIDsH}} ) {
++            CUL_HM_ID2PeerList($chann,$_,1) for ('peerUnread',split q{,},AttrVal($chann,'peerIDs',''));
++        } #Beta-User: Might not have been called earlier. Then subtype is unknown yet, https://forum.fhem.de/index.php/topic,123136.msg1177303.html#msg1177303;
++        CUL_HM_SetList($chann,'') if $fromUpdate || !defined $defs{$chann}{helper}{cmds}{cmdLst};
++        CUL_HM_AttrAssign($chann) if $fromUpdate; #Beta-User: add .AttrList for virtual channels
++        $defs{$chann}->{'.AttrList'} =~ s{IOList |expert[\S]+ |levelRange }{}g if defined $defs{$chann}->{'.AttrList'}; #Beta-User: some cleanup, but we may have to delete some more elements...
++    }
+   }
+   else{
++    CUL_HM_SetList($name,'') if $fromUpdate || !defined $defs{$name}{helper}{cmds}{cmdLst};
++    CUL_HM_AttrAssign($name) if $fromUpdate;
+     my @chanTypesList = split(',',$culHmModel->{$mId}{chn});
+     foreach my $chantype (@chanTypesList){# check all regulat channels
+       my ($chnTpName,$chnStart,$chnEnd) = split(':',$chantype);
+@@ -7672,6 +7781,7 @@
+           $attr{CUL_HM_id2Name($chnId)}{model} = $model ;
+           $chanExist{$chnId} = 1; # mark this channel as required
+         }
++        CUL_HM_SetList(CUL_HM_id2Name($chnId),"") if $fromUpdate; #!defined $defs{CUL_HM_id2Name($chnId)}{helper}{cmds}{cmdLst};
+         CUL_HM_AttrAssign(CUL_HM_id2Name($chnId));
+         $chnNoTyp++;
+       }
+@@ -8890,7 +9000,7 @@
+   if ($defs{$name}){
+     push @chnN,$name;
+     my $hash = $defs{$name};
+-    push @chnN,$hash->{$_} foreach (grep /^channel_/, keys %{$hash});
++    push @chnN,$hash->{$_} foreach (grep /^channel_/, sort keys %{$hash});
+   }
+   return sort(@chnN);
+ }
+@@ -9267,7 +9377,7 @@
+     $peer = "self".substr($peer,-2) if($peer =~ m/^${name}_chn-..$/);
+     my $ps = $peer eq "0" ? "R-" : "R-$peer-";
+     my %b = map { $_ => 1 }map {(my $foo = $_) =~ s/.?$ps//; $foo;} grep/.?$ps/,keys%{$defs{$name}{READINGS}};
+-    foreach my $t(keys %HMConfig::culHmTpl){
++    foreach my $t(reverse sort keys %HMConfig::culHmTpl){ #Beta-User: reverse sorting keys for tempListTmpl attribute, see https://forum.fhem.de/index.php/topic,122422.msg1176621.html#msg1176621
+       next if (not scalar (keys %{$HMConfig::culHmTpl{$t}{reg}}));
+       my $f = 0;
+       my $typShLg=0;
+@@ -9479,17 +9589,18 @@
+   my (undef,$name) = split(':',$tmrId,2);
+   return if (!defined $defs{$name} );
+   RemoveInternalTimer("cfgStateUpdate:$name") if($defs{$name}{helper}{cfgStateUpdt});#could be direct call or timeout
+-  if (   !$evtDly                      #noansi: first Readings must be set, helps also not to disturb others
++  if (   !$evtDly && $init_done && $fhem_started + 30 < time      #noansi: first Readings must be set, helps also not to disturb others
+       && !$defs{$name}{helper}{prt}{sProc} #not busy with commands?
+       ){
+     $defs{$name}{helper}{cfgStateUpdt} = 0;
+     my ($hm) = devspec2array("TYPE=HMinfo");
+     HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($name),$name)).")\$") if (defined $hm);
+   }
+-  else{
++  else { 
+     $defs{$name}{helper}{cfgStateUpdt} = 1;  # use to remove duplicate timer                                                                       
+-    InternalTimer(gettimeofday() + 60, "CUL_HM_cfgStateUpdate","cfgStateUpdate:$name", 0); # try later
++    InternalTimer(gettimeofday() + 60, "CUL_HM_cfgStateUpdate","cfgStateUpdate:$name", 0) if $init_done || length(CUL_HM_name2Id($name)) == 6; # try later; #Beta-User: but only for main device if called before init_done
+   }
++  return;
+ }
+ 
+ sub CUL_HM_rmOldRegs($$){ # remove register i outdated
+@@ -9627,7 +9738,7 @@
+     }
+     else     { # success - now update some datafiels
+       Log3 undef, 3, "additional HM config file loaded: $file";
+-      foreach (keys %{$culHmModel}){
++      foreach (sort keys %{$culHmModel}){
+         next if(!$_);
+         $culHmModel2Id->{$culHmModel->{$_}{name}} = $_ ;
+         $culHmModel->{$_}{alias} = $culHmModel->{$_}{name} if (!defined $culHmModel->{$_}{alias});
+@@ -10595,7 +10706,8 @@
+ }
+ sub CUL_HM_noDup(@) {#return list with no duplicates
+   my %all;
+-  return "" if (scalar(@_) == 0);
++  #return "" if (scalar(@_) == 0); #martinp876: @Ansgar: noDup muss ich noch untersuchen. Wird häufig benötigt...
++  return @_ if (!scalar(@_)); #noansi: return empty array instead of empty string, https://forum.fhem.de/index.php/topic,122107.msg1168262.html#msg1168262
+   $all{$_}=0 foreach (grep {defined $_ && $_ !~ m/^$/} @_);
+   delete $all{""}; #remove empties if present
+   return (sort keys %all);
+@@ -10691,7 +10803,12 @@
+                        ,sort map{"IO:$_"} split(",",AttrVal($name,"IOList",""))
+                        ,sort devspec2array("TYPE=CUL_HM:FILTER=IOgrp=$name.*") # devices assigned to the vccu
+                    )." ";
+-  $defs{$name}{'.AttrList'}    =~ s/logIDs:.*? /$logOpt/;
++  #$defs{$name}{'.AttrList'}    =~ s/logIDs:.*? /$logOpt/;
++  if ( defined $defs{$name}{'.AttrList'} ) { #Beta-User: fixes "uninitialized ... in substitution" warning at startup
++      $defs{$name}{'.AttrList'} =~ s/logIDs:.*? /$logOpt/;
++  } else {
++      $defs{$name}{'.AttrList'} = $logOpt;
++  }
+ 
+   # --- search for peers to CCU and potentially device this channel
+   # create missing CCU channels 
+@@ -10800,7 +10917,8 @@
+       ($iom) =    ((sort {@{$hh->{mRssi}{io}{$b}}[0] <=>     # This is the best choice
+                             @{$hh->{mRssi}{io}{$a}}[0] } 
+                           (grep { defined @{$hh->{mRssi}{io}{$_}}[0]} @ioccu))
+-                         ,(grep {!defined @{$hh->{mRssi}{io}{$_}}[0]} @ioccu))      if(@ioccu);
++                         ,(grep {!defined @{$hh->{mRssi}{io}{$_}}
++                         [0]} @ioccu))      if(@ioccu);
+     } 
+     ($iom) = grep{defined $defs{$_}} @{$hh->{io}{prefIO}}                           if(!$iom && @{$hh->{io}{prefIO}});
+     ($iom) = grep{defined $defs{$_}} @{$defs{$hh->{io}{vccu}}{helper}{io}{ioList}}  if(!$iom && @{$defs{$hh->{io}{vccu}}{helper}{io}{ioList}});
+@@ -10817,16 +10935,16 @@
+       $dIo = $oldIODevH->{NAME};
+     }
+     else {
+-      my @IOs = devspec2array("Clients=:CUL_HM:");
++      my @IOs = devspec2array('Clients=.*:CUL_HM:.*');
+       ($dIo) = (grep{CUL_HM_operIObyIOName($_)} @IOs,@IOs);# tricky: use first active IO else use any IO for CUL_HM
+     }
+     $newIODevH  = $defs{$dIo} if($dIo);
+   }
+ 
+   my $result = 0; # default: IO unchanged
+-  if(  (defined $newIODevH && (!defined($oldIODevH) || $newIODevH != $oldIODevH))){
++  if(  (defined $newIODevH && (!defined($oldIODevH) || $newIODevH ne $oldIODevH))){ #Beta-User: nummeric comparison might be wrong?
+     my $ID = CUL_HM_hash2Id($hash);
+-    IOWrite($hash, "", "remove:".$ID) if(defined($oldIODevH) && defined $oldIODevH->{NAME}); #IODev still old
++    IOWrite($hash, "", "remove:".$ID) if(defined($oldIODevH) && defined $oldIODevH->{NAME} && $oldIODevH->{TYPE} && $oldIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/); #IODev still old #Beta-User: might prevent log entries for CUL Type IO's
+     AssignIoPort($hash,$newIODevH->{NAME}); #  send preferred
+     $hash->{IODev} = $newIODevH;
+     if (   ($newIODevH->{TYPE} && $newIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/)
+@@ -11267,6 +11385,7 @@
+     $modules{CUL_HM}{helper}{cfgCmpl}{$name} = 1;#mark config as complete
+   }
+ }
++
+ sub CUL_HM_configUpdate($)   {# mark entities with changed data for archive
+   my $name = shift;
+   $modules{CUL_HM}{helper}{confUpdt}{$name} = 1;
+@@ -11302,7 +11421,7 @@
+   my %dlf = (1=>{Sat=>0,Sun=>0,Mon=>0,Tue=>0,Wed=>0,Thu=>0,Fri=>0},
+              2=>{Sat=>0,Sun=>0,Mon=>0,Tue=>0,Wed=>0,Thu=>0,Fri=>0},
+              3=>{Sat=>0,Sun=>0,Mon=>0,Tue=>0,Wed=>0,Thu=>0,Fri=>0});
+-  return "unused" if ($template =~ m/^(none|0) *$/);
++  return "unused" if ($template =~ m/^(none|0) *$/); #Beta-User: "unused" is needed for HMinfo_configCheck()
+   my $ret = "";
+   my @el = split",",$name;
+   my ($fName,$tmpl) = split":",$template;
+@@ -11551,6 +11670,8 @@
+ 
+ 1;
+ 
++__END__
++
+ =pod
+ =encoding utf8
+ =item device
+@@ -11562,7 +11683,7 @@
+   <ul>
+     Support for eQ-3 HomeMatic devices via the <a href="#CUL">CUL</a> or the <a href="#HMLAN">HMLAN</a>.<br>
+     <br>
+-    <a id="CUL_HM-define"></a><b>Define</b>
++    <a id="CUL_HM-define"></a><h4>Define</h4>
+     <ul>
+       <code><B>define &lt;name&gt; CUL_HM &lt;6-digit-hex-code|8-digit-hex-code&gt;</B></code>
+   
+@@ -11669,7 +11790,7 @@
+         </li>
+       </ul>
+     </ul><br>
+-    <a id="CUL_HM-set"></a><b>Set</b>
++    <a id="CUL_HM-set"></a><h4>Set</h4>
+     <ul>
+       Note: devices which are normally send-only (remote/sensor/etc) must be set
+       into pairing/learning mode in order to receive the following commands.
+@@ -11677,12 +11798,12 @@
+   
+       Universal commands (available to most hm devices):
+       <ul>
+-        <li><B>assignHmKey</B><a id="CUL_HM-set-assignHmKey"></a><br>
++        <li><a id="CUL_HM-set-assignHmKey"></a><B>assignHmKey</B><br>
+           Initiates a key-exchange with the device, exchanging the old AES-key of the device with the key with the highest
+           index defined by the attribute hmKey* in the HMLAN or VCCU. The old key is determined by the reading aesKeyNbr,
+           which specifies the index of the old key when the reading is divided by 2.
+         </li>
+-        <li><B>clear &lt;[rssi|readings|register|msgEvents|attack|all]&gt;</B><a id="CUL_HM-set-clear"></a><br>
++        <li><a id="CUL_HM-set-clear"></a><B>clear &lt;[rssi|readings|register|msgEvents|attack|all]&gt;</B><br>
+           A set of variables can be removed.<br>
+           <ul>
+             readings: all readings will be deleted. Any new reading will be added usual. May be used to eliminate old data<br>
+@@ -11693,7 +11814,7 @@
+             all:  all of the above. <br>
+           </ul>
+         </li>
+-        <li><B>getConfig</B><a id="CUL_HM-set-getConfig"></a><br>
++        <li><a id="CUL_HM-set-getConfig"></a><B>getConfig</B><br>
+           Will read major configuration items stored in the HM device. Executed
+           on a channel it will read pair Inforamtion, List0, List1 and List3 of
+           the 1st internal peer. Furthermore the peerlist will be retrieved for
+@@ -11702,7 +11823,7 @@
+           configuration for additional peers.  <br> The command is a shortcut
+           for a selection of other commands.
+         </li>
+-        <li><B>getRegRaw [List0|List1|List2|List3|List4|List5|List6|List7]&lt;peerChannel&gt; </B><a id="CUL_HM-set-getRegRaw"></a><br>
++        <li><a id="CUL_HM-set-getRegRaw"></a><B>getRegRaw [List0|List1|List2|List3|List4|List5|List6|List7]&lt;peerChannel&gt; </B><br>
+         
+             Read registerset in raw format. Description of the registers is beyond
+             the scope of this documentation.<br>
+@@ -11757,7 +11878,7 @@
+              set mydimmer getRegRaw List3 all <br>
+            </code></ul>
+          </li>
+-        <li><B>getSerial</B><a id="CUL_HM-set-getSerial"></a><br>
++        <li><a id="CUL_HM-set-getSerial"></a><B>getSerial</B><br>
+           Read serial number from device and write it to attribute serialNr.
+         </li>
+         <li><a id="CUL_HM-set-inhibit"></a><B>inhibit [on|off]</B><br>
+@@ -11773,7 +11894,7 @@
+           </ul></code>
+          </li>
+         
+-        <li><B>pair</B><a id="CUL_HM-set-pair"></a><br>
++        <li><a id="CUL_HM-set-pair"></a><B>pair</B><br>
+           Pair the device with a known serialNumber (e.g. after a device reset)
+           to FHEM Central unit. FHEM Central is usualy represented by CUL/CUNO,
+           HMLAN,...
+@@ -11786,7 +11907,7 @@
+           Don't confuse pair (to a central) with peer (channel to channel) with
+           <a href="#CUL_HM-set-peerChan">peerChan</a>.<br>
+         </li>
+-        <li><B>peerBulk</B> &lt;peerch1,peerch2,...&gt; [set|unset]<a id="CUL_HM-set-peerBulk"></a><br>
++        <li><a id="CUL_HM-set-peerBulk"></a><B>peerBulk</B> &lt;peerch1,peerch2,...&gt; [set|unset]<br>
+           peerBulk will add peer channels to the channel. All peers in the list will be added. <br>
+           with unset option the peers in the list will be subtracted from the device's peerList.<br>
+           peering sets the configuration of this link to its defaults. As peers are not
+@@ -11807,7 +11928,7 @@
+             set myChannel peerBulk 12345601 unset # remove peer 123456 channel 01<br>
+           </code></ul>
+         </li>
+-        <li><B>regBulk  &lt;reg List&gt;.&lt;peer&gt; &lt;addr1:data1&gt; &lt;addr2:data2&gt;...</B><a id="CUL_HM-set-regBulk"></a><br>
++        <li><a id="CUL_HM-set-regBulk"></a><B>regBulk  &lt;reg List&gt;.&lt;peer&gt; &lt;addr1:data1&gt; &lt;addr2:data2&gt;...</B><br>
+           This command will replace the former regRaw. It allows to set register
+           in raw format. Its main purpose is to restore a complete register list
+           to values secured before. <br>
+@@ -11830,7 +11951,7 @@
+           </code></ul>
+           myblind will set the max drive time up for a blind actor to 25,6sec
+         </li>
+-        <li><B>regSet [prep|exec] &lt;regName&gt; &lt;value&gt; &lt;peerChannel&gt;</B><a id="CUL_HM-set-regSet"></a><br>
++        <li><a id="CUL_HM-set-regSet"></a><B>regSet [prep|exec] &lt;regName&gt; &lt;value&gt; &lt;peerChannel&gt;</B><br>
+           For some major register a readable version is implemented supporting
+           register names &lt;regName&gt; and value conversionsing. Only a subset
+           of register can be supproted.<br>
+@@ -11850,24 +11971,24 @@
+           using<br>
+           <ul><code>set regSet &lt;regname&gt; ? 0</code></ul>
+         </li>
+-        <li><B>reset</B><a id="CUL_HM-set-reset"></a><br>
++        <li><a id="CUL_HM-set-reset"></a><B>reset</B><br>
+           Factory reset the device. You need to pair it again to use it with
+           fhem.
+         </li>
+-        <li><B>sign [on|off]</B><a id="CUL_HM-set-sign"></a><br>
++        <li><a id="CUL_HM-set-sign"></a><B>sign [on|off]</B><br>
+           Activate or deactivate signing (also called AES encryption, see the <a
+           href="#HMAES">note</a> above). Warning: if the device is attached via
+           a CUL, you need to install the perl-module Crypt::Rijndael to be
+           able to switch it (or deactivate signing) from fhem.
+         </li>
+-        <li><B>statusRequest</B><a id="CUL_HM-set-statusRequest"></a><br>
++        <li><a id="CUL_HM-set-statusRequest"></a><B>statusRequest</B><br>
+           Update device status. For multichannel devices it should be issued on
+           an per channel base
+         </li>
+-        <li><B>unpair</B><a id="CUL_HM-set-unpair"></a><br>
++        <li><a id="CUL_HM-set-unpair"></a><B>unpair</B><br>
+           "Unpair" the device, i.e. make it available to pair with other master
+           devices. See <a href="#CUL_HM-set-pair">pair</a> for description.</li>
+-        <li><B>virtual &lt;number of buttons&gt;</B><a id="CUL_HM-set-virtual"></a><br>
++        <li><a id="CUL_HM-set-virtual"></a><B>virtual &lt;number of buttons&gt;</B><br>
+           configures a defined curcuit as virtual remote controll.  Then number
+           of button being added is 1 to 255. If the command is issued a second
+           time for the same entity additional buttons will be added. <br>
+@@ -11881,10 +12002,10 @@
+           </code></ul>
+           see also <a href="#CUL_HM-set-press">press</a>
+         </li>
+-        <li><B>deviceRename &lt;newName&gt;</B><a id="CUL_HM-set-deviceRename"></a><br>
++        <li><a id="CUL_HM-set-deviceRename"></a><B>deviceRename &lt;newName&gt;</B><br>
+           rename the device and all its channels.
+         </li>
+-        <li><B>fwUpdate [onlyEnterBootLoader] &lt;filename&gt; [&lt;waitTime&gt;]</B><a id="CUL_HM-set-fwUpdate"></a><br>
++        <li><a id="CUL_HM-set-fwUpdate"></a><B>fwUpdate [onlyEnterBootLoader] &lt;filename&gt; [&lt;waitTime&gt;]</B><br>
+           update Fw of the device. User must provide the appropriate file.
+           waitTime can be given optionally. In case the device needs to be set to
+           FW update mode manually this is the time the system will wait.<br>
+@@ -11900,17 +12021,17 @@
+         <br>
+         <li>switch
+           <ul>
+-            <li><B>on</B> <a id="CUL_HM-set-on"> </a> - set level to 100%</li>
+-            <li><B>off</B><a id="CUL_HM-set-off"></a> - set level to 0%</li>
+-            <li><B>on-for-timer &lt;sec&gt;</B><a id="CUL_HM-set-onForTimer"></a> -
++            <li><a id="CUL_HM-set-on"></a><B>on</B> - set level to 100%</li>
++            <li><a id="CUL_HM-set-off"></a><B>off</B> - set level to 0%</li>
++            <li><a id="CUL_HM-set-onForTimer"></a><B>on-for-timer &lt;sec&gt;</B> -
+               set the switch on for the given seconds [0-85825945].<br> Note:
+               off-for-timer like FS20 is not supported. It may to be programmed
+               thru channel register.</li>
+-            <li><B>on-till &lt;time&gt;</B><a id="CUL_HM-set-onTill"></a> - set the switch on for the given end time.<br>
++            <li><a id="CUL_HM-set-onTill"></a><B>on-till &lt;time&gt;</B> - set the switch on for the given end time.<br>
+               <ul><code>set &lt;name&gt; on-till 20:32:10<br></code></ul>
+               Currently a max of 24h is supported with endtime.<br>
+             </li>
+-            <li><B>pressL &lt;peer&gt; [&lt;repCount&gt;] [&lt;repDelay&gt;] </B><a id="CUL_HM-set-pressL"></a><br>
++            <li><a id="CUL_HM-set-pressL"></a><B>pressL &lt;peer&gt; [&lt;repCount&gt;] [&lt;repDelay&gt;] </B><br>
+                 simulate a press of the local button or direct connected switch of the actor.<br>
+                 <B>&lt;peer&gt;</B> allows to stimulate button-press of any peer of the actor. 
+                                     i.e. if the actor is peered to any remote, virtual or io (HMLAN/CUL) 
+@@ -11925,10 +12046,10 @@
+                    set actor pressL fhem02 # trigger short of FHEM channel 2<br>
+                 </code>
+             </li>
+-            <li><B>pressS &lt;peer&gt;</B><a id="CUL_HM-set-pressS"></a><br>
++            <li><a id="CUL_HM-set-pressS"></a><B>pressS &lt;peer&gt;</B><br>
+                 simulates a short press similar to long press
+             </li>
+-            <li><B>eventL &lt;peer&gt; &lt;condition&gt; [&lt;repCount&gt;] [&lt;repDelay&gt;] </B><a id="CUL_HM-set-eventL"></a><br>
++            <li><a id="CUL_HM-set-eventL"></a><B>eventL &lt;peer&gt; &lt;condition&gt; [&lt;repCount&gt;] [&lt;repDelay&gt;] </B><br>
+                 simulate an event of an peer and stimulates the actor.<br>
+                 <B>&lt;peer&gt;</B> allows to stimulate button-press of any peer of the actor. 
+                                     i.e. if the actor is peered to any remote, virtual or io (HMLAN/CUL) 
+@@ -11939,10 +12060,10 @@
+                    set actor eventL md 30 # trigger from motion detector with level 30<br>
+                 </code>
+             </li>
+-            <li><B>eventS &lt;peer&gt; &lt;condition&gt; </B><a id="CUL_HM-set-eventS"></a><br>
++            <li><a id="CUL_HM-set-eventS"></a><B>eventS &lt;peer&gt; &lt;condition&gt; </B><br>
+                 simulates a short event from a peer of the actor. Typically sensor do not send long events.
+             </li>
+-            <li><B>toggle</B><a id="CUL_HM-set-toggle"></a> - toggle the Actor. It will switch from any current
++            <li><a id="CUL_HM-set-toggle"></a><B>toggle</B> - toggle the Actor. It will switch from any current
+                  level to off or from off to 100%</li>
+           </ul>
+           <br>
+@@ -11966,7 +12087,7 @@
+              <li><B><a href="#CUL_HM-set-off">off</a></B></li>
+              <li><B><a href="#CUL_HM-set-press">press &lt;[short|long]&gt;&lt;[on|off]&gt;</a></B></li>
+              <li><B><a href="#CUL_HM-set-toggle">toggle</a></B></li>
+-             <li><B>toggleDir</B><a id="CUL_HM-set-toggleDir"></a> - toggled drive direction between up/stop/down/stop</li>
++             <li><a id="CUL_HM-set-toggleDir"></a><B>toggleDir</B> - toggled drive direction between up/stop/down/stop</li>
+              <li><B><a href="#CUL_HM-set-onForTimer">on-for-timer &lt;sec&gt;</a></B> - Dimmer only! <br></li>
+              <li><B><a href="#CUL_HM-set-onTill">on-till &lt;time&gt;</a></B> - Dimmer only! <br></li>
+              <li><B>stop</B> - stop motion (blind) or dim ramp</li>
+@@ -11984,7 +12105,7 @@
+            </ul>
+           <br>
+         </li>
+-        <li>remotes, pushButton<a id="CUL_HM-set-remote"></a><br>
++        <li><a id="CUL_HM-set-remote"></a>remotes, pushButton<br>
+              This class of devices does not react on requests unless they are put
+              to learn mode. FHEM obeys this behavior by stacking all requests until
+              learn mode is detected. Manual interaction of the user is necessary to
+@@ -11992,21 +12113,21 @@
+              device level with parameter 'protCmdPend'.
+         </li>
+         <ul>
+-          <li><B>trgEventS [all|&lt;peer&gt;] &lt;condition&gt;</B><a id="CUL_HM-set-trgEventS"></a><br>
++          <li><a id="CUL_HM-set-trgEventS"></a><B>trgEventS [all|&lt;peer&gt;] &lt;condition&gt;</B><br>
+                Issue eventS on the peer entity. If <B>all</B> is selected each of the peers will be triggered. See also <a href="#CUL_HM-set-eventS">eventS</a><br>
+                <B>&lt;condition&gt;</B>: is the condition being transmitted with the event. E.g. the brightness in case of a motion detector. 
+           </li>
+-          <li><B>trgEventL [all|&lt;peer&gt;] &lt;condition&gt;</B><a id="CUL_HM-set-trgEventL"></a><br>
++          <li><a id="CUL_HM-set-trgEventL"></a><B>trgEventL [all|&lt;peer&gt;] &lt;condition&gt;</B><br>
+                Issue eventL on the peer entity. If <B>all</B> is selected each of the peers will be triggered. a normal device will not sent event long. See also <a href="#CUL_HM-set-eventL">eventL</a><br>
+                <B>&lt;condition&gt;</B>: is the condition being transmitted with the event. E.g. the brightness in case of a motion detector. 
+           </li>
+-          <li><B>trgPressS [all|&lt;peer&gt;] </B><a id="CUL_HM-set-trgPressS"></a><br>
++          <li><a id="CUL_HM-set-trgPressS"></a><B>trgPressS [all|&lt;peer&gt;]</B><br>
+                Issue pressS on the peer entity. If <B>all</B> is selected each of the peers will be triggered. See also <a href="#CUL_HM-set-pressS">pressS</a><br>
+           </li>
+-          <li><B>trgPressL [all|&lt;peer&gt;] </B><a id="CUL_HM-set-trgPressL"></a><br>
++          <li><a id="CUL_HM-set-trgPressL"></a><B>trgPressL [all|&lt;peer&gt;]</B><br>
+                Issue pressL on the peer entity. If <B>all</B> is selected each of the peers will be triggered. See also <a href="#CUL_HM-set-pressL">pressL</a><br>
+           </li>
+-          <li><B>peerIODev [IO] &lt;btn_no&gt; [<u>set</u>|unset]</B><a id="CUL_HM-set-peerIODev"></a><br>
++          <li><a id="CUL_HM-set-peerIODev"></a><B>peerIODev [IO] &lt;btn_no&gt; [<u>set</u>|unset]</B><br>
+                The command is similar to <B><a href="#CUL_HM-set-peerChan">peerChan</a></B>. 
+                While peerChan
+                is executed on a remote and peers any remote to any actor channel peerIODev is 
+@@ -12015,7 +12136,7 @@
+                will be peered/unpeerd to the actor. <a href="#CUL_HM-set-press">press</a> can be
+                used to stimulate the related actions as defined in the actor register.
+           </li>
+-          <li><B>peerSmart [&lt;peer&gt;] </B><a id="CUL_HM-set-peerSmart"></a><br>
++          <li><a id="CUL_HM-set-peerSmart"></a><B>peerSmart [&lt;peer&gt;]</B><br>
+                The command is similar to <B><a href="#CUL_HM-set-peerChan">peerChan</a></B>. 
+                peerChan uses only one parameter, the peer which the channel shall be peered to. <br>
+                Therefore peerSmart peers always in single mode (see peerChan). Funktionallity of the peered actor shall be applied 
+@@ -12023,8 +12144,7 @@
+                Smart register setting could be done using hmTemplate. <br>
+                peerSmart is also available for actor-channel.
+           </li>
+-          <li><B>peerChan &lt;btn_no&gt; &lt;actChan&gt; [single|<u>dual</u>|reverse][<u>set</u>|unset] [<u>both</u>|actor|remote]</B>
+-              <a id="CUL_HM-set-peerChan"></a><br>
++          <li><a id="CUL_HM-set-peerChan"></a><B>peerChan &lt;btn_no&gt; &lt;actChan&gt; [single|<u>dual</u>|reverse][<u>set</u>|unset] [<u>both</u>|actor|remote]</B><br>
+           
+                peerChan will establish a connection between a sender- <B>channel</B> and
+                an actuator-<B>channel</B> called link in HM nomenclatur. Peering must not be
+@@ -12100,10 +12220,10 @@
+                </code></ul>
+           </li>
+         </ul>
+-        <li>virtual<a id="CUL_HM-set-virtual"></a><br>
++        <li><a id="CUL_HM-set-virtual"></a>virtual<br>
+            <ul>
+              <li><B><a href="#CUL_HM-set-peerChan">peerChan</a></B> see remote</li>
+-             <li><B><a id="CUL_HM-set-press"></a>press [long|short] [&lt;peer&gt;] [&lt;repCount&gt;] [&lt;repDelay&gt;] </B>
++             <li><a id="CUL_HM-set-press"></a><B>press [long|short] [&lt;peer&gt;] [&lt;repCount&gt;] [&lt;repDelay&gt;]</B>
+                <ul>
+                  simulates button press for an actor from a peered sensor.
+                  will be sent of type "long".
+@@ -12113,15 +12233,15 @@
+                  <li>[&lt;repDelay&gt;] Valid for long press only. defines wait time between the single messages. </li>
+                </ul>
+              </li>
+-             <li><B>virtTemp &lt;[off -10..50]&gt;<a id="CUL_HM-set-virtTemp"></a></B>
++             <li><a id="CUL_HM-set-virtTemp"></a><B>virtTemp &lt;[off -10..50]&gt;</B>
+                simulates a thermostat. If peered to a device it periodically sends the
+                temperature until "off" is given. See also <a href="#CUL_HM-set-virtHum">virtHum</a><br>
+              </li>
+-             <li><B>virtHum &lt;[off -10..50]&gt;<a id="CUL_HM-set-virtHum"></a></B>
++             <li><a id="CUL_HM-set-virtHum"></a><B>virtHum &lt;[off -10..50]&gt;</B>
+                simulates the humidity part of a thermostat. If peered to a device it periodically sends 
+                the temperature and humidity until both are "off". See also <a href="#CUL_HM-set-virtTemp">virtTemp</a><br>
+              </li>
+-             <li><B>valvePos &lt;[off 0..100]&gt;<a id="CUL_HM-set-valvePos"></a></B>
++             <li><a id="CUL_HM-set-valvePos"></a><B>valvePos &lt;[off 0..100]&gt;</B>
+                stimulates a VD<br>
+              </li>
+            </ul>
+@@ -12298,7 +12418,7 @@
+               spaces must not be used in the list.<br>
+               <b>replay</b> can be entered to repeat the last sound played once more.<br>
+               <b>repeat</b> defines how often the sequence shall be played. Defaults to 1.<br>
+- 	      <b>volume</b> is defined between 0 and 10. 0 stops any sound currently playing. Defaults to 10 (100%).<br>
++          <b>volume</b> is defined between 0 and 10. 0 stops any sound currently playing. Defaults to 10 (100%).<br>
+               Example:
+               <ul><code>
+                  # "hello" in display, symb bulb on, backlight, beep<br>
+@@ -12489,9 +12609,9 @@
+     </ul>
+     </ul>
+     <br>
+-    <a id="CUL_HM-get"></a><b>Get</b><br>
++    <a id="CUL_HM-get"></a><h4>Get</h4><br>
+     <ul>
+-       <li><B>configSave &lt;filename&gt;</B><a id="CUL_HM-get-configSave"></a><br>
++       <li><a id="CUL_HM-get-configSave"></a><B>configSave &lt;filename&gt;</B><br>
+            Saves the configuration of an entity into a file. Data is stored in a
+            format to be executed from fhem command prompt.<br>
+            The file is located in the fhem home directory aside of fhem.cfg. Data
+@@ -12530,15 +12650,15 @@
+            Note: if this command is executed on a channel and 'model' is
+            requested the content hosting device's 'model' will be returned.
+            </li>
+-       <li><B>reg &lt;addr&gt; &lt;list&gt; &lt;peerID&gt;</B><a id="CUL_HM-get-reg"></a><br>
++       <li><a id="CUL_HM-get-reg"></a><B>reg &lt;addr&gt; &lt;list&gt; &lt;peerID&gt;</B><br>
+            returns the value of a register. The data is taken from the storage in FHEM and not 
+-  		 read directly outof the device. 
+-  		 If register content is not present please use getConfig, getReg in advance.<br>
++           read directly outof the device. 
++           If register content is not present please use getConfig, getReg in advance.<br>
+   
+            &lt;addr&gt; address in hex of the register. Registername can be used alternaly 
+-  		 if decoded by FHEM. "all" will return all decoded register for this entity in one list.<br>
++           if decoded by FHEM. "all" will return all decoded register for this entity in one list.<br>
+            &lt;list&gt; list from which the register is taken. If rgistername is used list 
+-  		 is ignored and can be set to 0.<br>
++           is ignored and can be set to 0.<br>
+            &lt;peerID&gt; identifies the registerbank in case of list3 and list4. It an be set to dummy if not used.<br>
+            </li>
+        <li><B>regVal &lt;addr&gt; &lt;list&gt; &lt;peerID&gt;</B><br>
+@@ -12549,7 +12669,7 @@
+            Note that there could be more register implemented for a device.<br>
+            </li>
+   
+-       <li><B>saveConfig &lt;file&gt;</B><a id="CUL_HM-get-saveConfig"></a><br>
++       <li><a id="CUL_HM-get-saveConfig"></a><B>saveConfig &lt;file&gt;</B><br>
+            stores peers and register to the file.<br>
+            Stored will be the data as available in fhem. It is necessary to read the information from the device prior to the save.<br>
+            The command supports device-level action. I.e. if executed on a device also all related channel entities will be stored implicitely.<br>
+@@ -12562,7 +12682,7 @@
+            prior to rewrite data to an entity it is necessary to pair the device with FHEM.<br>
+            restore will not delete any peered channels, it will just add peer channels.<br>
+            </li>
+-       <li><B>list (normal|hidden);</B><a id="CUL_HM-get-list"></a><br>
++       <li><a id="CUL_HM-get-list"></a><B>list (normal|hidden);</B><br>
+            issue list command for the fiven entity normal or including the hidden parameter
+            </li>       
+        <li><B>listDevice</B><br>
+@@ -12586,7 +12706,7 @@
+            </li>       
+     </ul><br>
+ 
+-    <a id="CUL_HM-attr"></a><b>Attributes</b>
++    <a id="CUL_HM-attr"></a><h4>Attributes</h4>
+     <ul>
+       <li><a href="#eventMap">eventMap</a></li>
+       <li><a href="#do_not_notify">do_not_notify</a></li>
+@@ -12594,12 +12714,12 @@
+       <li><a href="#dummy">dummy</a></li>
+       <li><a href="#showtime">showtime</a></li>
+       <li><a href="#readingFnAttributes">readingFnAttributes</a></li>
+-      <li><a id="CUL_HM-attr-actAutoTry">actAutoTry</a><br>
++      <li><a id="CUL_HM-attr-actAutoTry"></a>actAutoTry<br>
+            actAutoTry 0_off,1_on<br>
+            setting this option enables Action Detector to send a statusrequest in case of a device is going to be marked dead.
+            The attribut may be useful in case a device is being checked that does not send messages regularely - e.g. an ordinary switch. 
+           </li>
+-      <li><a id="CUL_HM-attr-actCycle">actCycle</a>actCycle &lt;[hhh:mm]|off&gt;<br>
++      <li><a id="CUL_HM-attr-actCycle"></a>actCycle &lt;[hhh:mm]|off&gt;<br>
+            Supports 'alive' or better 'not alive' detection for devices. [hhh:mm] is the maximum silent time for the device. 
+            Upon no message received in this period an event will be raised "&lt;device&gt; is dead". 
+            If the device sends again another notification is posted "&lt;device&gt; is alive". <br>
+@@ -12615,18 +12735,18 @@
+            The overall function can be viewed checking out the "ActionDetector" entity. The status of all entities is present in the READING section.<br>
+            Note: This function can be enabled for devices with non-cyclic messages as well. It is up to the user to enter a reasonable cycletime.
+           </li>
+-      <li><a id="CUL_HM-attr-actStatus">actStatus</a><br>
++      <li><a id="CUL_HM-attr-actStatus"></a>actStatus<br>
+            readonly<br>
+            This attribut is set by ActionDetector. It cannot be set manually
+           </li>
+-      <li><a id="CUL_HM-attr-aesCommReq">aesCommReq</a><br>
++      <li><a id="CUL_HM-attr-aesCommReq"></a>aesCommReq<br>
+            if set IO is forced to request AES signature before sending ACK to the device.<br>
+            Defautls to 0<br>
+           </li>
+-      <li><a id="CUL_HM-attr-aesKey">aesKey</a><br>
++      <li><a id="CUL_HM-attr-aesKey"></a>aesKey<br>
+           specifies which aes key is to be used if aesCommReq is active<br>
+           </li>
+-      <li><a id="CUL_HM-attr-autoReadReg">autoReadReg</a><br>
++      <li><a id="CUL_HM-attr-autoReadReg"></a>autoReadReg<br>
+           '0' autoReadReg will be ignored.<br>
+           '1' will execute a getConfig for the device automatically after each reboot of FHEM. <br>
+           '2' like '1' plus execute after power_on.<br>
+@@ -12645,14 +12765,14 @@
+               until the device "wakes up".<br>
+               </ul>
+           </li>
+-      <li><a id="CUL_HM-attr-burstAccess">burstAccess</a><br>
++      <li><a id="CUL_HM-attr-burstAccess"></a>burstAccess<br>
+           can be set for the device entity if the model allowes conditionalBurst.
+           The attribut will switch off burst operations (0_off) which causes less message load
+           on HMLAN and therefore reduces the chance of HMLAN overload.<br>
+           Setting it on (1_auto) allowes shorter reaction time of the device. User does not
+           need to wait for the device to wake up. <br>
+           Note that also the register burstRx needs to be set in the device.</li>
+-      <li><a id="CUL_HM-attr-expert">expert &lt;option1[[,option2],...]&gt;</a><br>
++      <li><a id="CUL_HM-attr-expert"></a>expert &lt;option1[[,option2],...]&gt;<br>
+           This attribut controls the visibility of the register readings. This attibute controls
+           the presentation of device parameter in readings.<br>
+           Options are:<br>
+@@ -12665,23 +12785,23 @@
+           </ul>
+           If expert is applied to the device it is used for assotiated channels if not overwritten by it.<br>
+           </li>
+-      <li><a id="CUL_HM-attr-commStInCh">communication status copied to channel reading</a><br>
++      <li><a id="CUL_HM-attr-commStInCh"></a>communication status copied to channel reading<br>
+           on: device communication status not visible in channel entities<br>
+           off: device communication status commState is visiblein channel entities<br>
+           </li>
+-      <li><a id="CUL_HM-attr-firmware">firmware &lt;FWversion&gt;</a><br>
++      <li><a id="CUL_HM-attr-firmware"></a>firmware &lt;FWversion&gt;<br>
+           Firmware version of the device. Should not be overwritten.
+           </li>
+-      <li><a id="CUL_HM-attr-hmKey">hmKey &lt;key&gt;</a><br>
++      <li><a id="CUL_HM-attr-hmKey"></a>hmKey &lt;key&gt;<br>
+           AES key to be used
+           </li>
+-      <li><a id="CUL_HM-attr-hmKey2">hmKey2 &lt;key&gt;</a><br>
++      <li><a id="CUL_HM-attr-hmKey2"></a>hmKey2 &lt;key&gt;<br>
+           AES key to be used
+           </li>
+-      <li><a id="CUL_HM-attr-hmKey3">hmKey3 &lt;key&gt;</a><br>
++      <li><a id="CUL_HM-attr-hmKey3"></a>hmKey3 &lt;key&gt;<br>
+           AES key to be used
+           </li>
+-      <li><a id="CUL_HM-attr-hmProtocolEvents">hmProtocolEvents</a><br>
++      <li><a id="CUL_HM-attr-hmProtocolEvents"></a>hmProtocolEvents<br>
+           parses and logs the device messages. This is performance consuming and may disturb the timing. Use with care.<br>
+           Options:<br>
+           <ul>
+@@ -12691,10 +12811,10 @@
+           3_dumpTrigger : log full and include trigger events<br>
+           </ul>
+           </li>
+-      <li><a id="CUL_HM-attr-readOnly">readOnly</a><br>
++      <li><a id="CUL_HM-attr-readOnly"></a>readOnly<br>
+           1: restricts commands to read od observ only.
+           </li>
+-      <li><a id="CUL_HM-attr-readingOnDead">readingOnDead</a><br>
++      <li><a id="CUL_HM-attr-readingOnDead"></a>readingOnDead<br>
+           defines how readings shall be treated upon device is marked 'dead'.<br>
+           The attribute is applicable for devices only. It will modify the readings upon entering dead of the device. 
+           Upon leaving state 'dead' the selected readings will be set to 'notDead'. It is expected that useful values will be filled by the normally operating device.<br>
+@@ -12716,12 +12836,12 @@
+             attr myDevice readingOnDead state,deviceMsg,CommandAccepted # upon entering dead state,deviceMsg and CommandAccepted of the device will be set to 'dead' if available.<br>
+           </code></ul>           
+           </li>
+-      <li><a id="CUL_HM-attr-rssiLog">rssiLog</a><br>
++      <li><a id="CUL_HM-attr-rssiLog"></a>rssiLog<br>
+           can be given to devices, denied for channels. If switched '1' each RSSI entry will be
+           written to a reading. User may use this to log and generate a graph of RSSI level.<br>
+           Due to amount of readings and events it is NOT RECOMMENDED to switch it on by default.
+           </li>
+-      <li><a id="CUL_HM-attr-IOgrp">IOgrp</a><br>
++      <li><a id="CUL_HM-attr-IOgrp"></a>IOgrp<br>
+           can be given to devices and shall point to a virtual CCU. 
+           Setting the attribut will remove attr IODev since it mutual exclusiv. 
+           As a consequence the
+@@ -12739,7 +12859,7 @@
+             attr myDevice2 IOgrp vccu:prefIO1,prefIO2,none<br>
+           </code></ul>
+           </li>
+-      <li><a id="CUL_HM-attr-levelRange">levelRange &lt;min,max&gt;</a><br>
++      <li><a id="CUL_HM-attr-levelRange"></a>levelRange &lt;min,max&gt;<br>
+           It defines the usable dimm-range.
+           Can be used for e.g. LED light starting at 10% and reach maxbrightness at 40%.
+           levelRange will normalize the level to this range. I.e. set to 100% will physically set the 
+@@ -12752,32 +12872,32 @@
+             attr myChannel levelRange 10,80<br>
+           </code></ul>
+           </li>
+-      <li><a id="CUL_HM-attr-levelMap">levelMap &lt;<val1>=<key1>[:<val2>=<key2>[:...]]&gt;</a><br>
++      <li><a id="CUL_HM-attr-levelMap"></a>levelMap &lt;<val1>=<key1>[:<val2>=<key2>[:...]]&gt;<br>
+           the level value valX will be replaced by keyX. Multiple values can be mapped. 
+           </li>
+-      <li><a id="CUL_HM-attr-modelForce">modelForce</a><br>
++      <li><a id="CUL_HM-attr-modelForce"></a>modelForce<br>
+           modelForce overwrites the model attribute. Doing that it converts the device and its channel to the new model.<br>
+           Reason for this attribute is an eQ3 bug as some devices are delivered with wrong Module IDs.<br>
+           ATTENTION: changing model id automatically starts reconfiguration of the device and its channels! channels may be deleted or incarnated<br>
+           </li>
+-      <li><a id="CUL_HM-attr-model">model</a><br>
++      <li><a id="CUL_HM-attr-model"></a>model<br>
+           showes model. This is read only.
+           </li>
+-      <li><a id="CUL_HM-attr-subType">subType</a><br>
++      <li><a id="CUL_HM-attr-subType"></a>subType<br>
+           showes models subType. This is read only.</li>
+-      <li><a id="CUL_HM-attr-serialNr">serialNr</a><br>
++      <li><a id="CUL_HM-attr-serialNr"></a>serialNr<br>
+           device serial number. Should not be set manually</li>
+-      <li><a id="CUL_HM-attr-msgRepeat">msgRepeat</a><br>
++      <li><a id="CUL_HM-attr-msgRepeat"></a>msgRepeat<br>
+           defines number of repetitions if a device doesn't answer in time. <br>
+           Devices which donly support config mode no repeat ist allowed. <br>
+           For devices with wakeup mode the device will wait for next wakeup. Lonng delay might be 
+           considered in this case. <br>
+           Repeat for burst devices will impact HMLAN transmission capacity.</li>
+-      <li><a id="CUL_HM-attr-param">param</a><br>
++      <li><a id="CUL_HM-attr-param"></a>param<br>
+           param defines model specific behavior or functions. See <a href="#CUL_HM-attr-params"><b>available parameter</b></a> for details</li>
+-      <li><a id="CUL_HM-attr-peerIDs">peerIDs</a><br>
++      <li><a id="CUL_HM-attr-peerIDs"></a>peerIDs<br>
+           will be filled automatically by getConfig and shows the direct peerings of the channel. Should not be changed by user.</li>
+-      <li><a id="CUL_HM-attr-rawToReadable">rawToReadable</a><br>
++      <li><a id="CUL_HM-attr-rawToReadable"></a>rawToReadable<br>
+           Used to convert raw KFM100 values to readable data, based on measured
+           values. E.g.  fill slowly your container, while monitoring the
+           values reported with <a href="#inform">inform</a>. You'll see:
+@@ -12790,22 +12910,22 @@
+           Apply these values with: "attr KFM100 rawToReadable 10:0 50:20 79:40 270:100".
+           fhem will do a linear interpolation for values between the bounderies.
+           </li>
+-      <li><a id="CUL_HM-attr-tempListTmpl">tempListTmpl</a><br>
++      <li><a id="CUL_HM-attr-tempListTmpl"></a>tempListTmpl<br>
+           Sets the default template for a heating controller. If not given the detault template is taken from 
+           file tempList.cfg using the enitity name as template name (e.g. ./tempLict.cfg:RT1_Clima <br> 
+-          To avoid template usage set this attribut to  '0'.<br> 
++          To avoid template usage set this attribut to 'none' or '0'.<br> 
+           Format is &lt;file&gt;:&lt;templatename&gt;. lt
+           </li>
+-      <li><a id="CUL_HM-attr-unit">unit</a><br>
++      <li><a id="CUL_HM-attr-unit"></a>unit<br>
+           set the reported unit by the KFM100 if rawToReadable is active. E.g.<br>
+           attr KFM100 unit Liter
+           </li>
+-      <li><a id="CUL_HM-attr-cyclicMsgOffset">cyclicMsgOffset</a><br>
++      <li><a id="CUL_HM-attr-cyclicMsgOffset"></a>cyclicMsgOffset<br>
+           when calculating the timestamp for sending the next cyclic message (e.g. weather or valve data) then the value of this attribute<br>
+           in milliseconds is added to the result. So adjusting this might fix problems for example when weather messages of virtual devices are not received reliably
+           </li>
+     </ul>  <br>
+-    <a id="CUL_HM-attr-params"><b>available parameter for attribut "param"</b></a>
++    <a id="CUL_HM-attr-params"></a><b>available parameter for attribut "param"</b>
+     <ul>
+       <li><B>HM-SEN-RD-O</B><br>
+         <B>offAtPon</B> heat channel only: force heating off after powerOn<br>
+@@ -12814,7 +12934,7 @@
+       <li><B>virtuals</B><br>
+         <B>noOnOff</B> virtual entity will not toggle state when trigger is received. If this parameter is
+         not given the entity will toggle its state between On and Off with each trigger<br>
+-        <B>msgReduce:&lt;No&gt;</B> if channel is used for <a ref="CUL_HM-set-valvePos"></a> it skips every No message
++        <B>msgReduce:&lt;No&gt;</B> if channel is used for <a ref="CUL_HM-set-valvePos">valvePos</a> it skips every No message
+         in order to reduce transmit load. Numbers from 0 (no skip) up to 9 can be given. 
+         VD will lose connection with more then 5 skips<br>
+       </li>
+@@ -12835,18 +12955,18 @@
+                          This results eventually in state on-till which allowes better icon handling.<br>
+       </li>
+     </ul><br>
+-    <a id="CUL_HM-events"><b>Generated events:</b></a>
++    <a id="CUL_HM-events"></a><h4>Generated events:</h4>
+     <ul>
+       <li><B>general</B><br>
+           recentStateType:[ack|info] # cannot be used ti trigger notifies<br>
+             <ul>
+               <li>ack indicates that some statusinfo is derived from an acknowledge</li>  
+               <li>info indicates an autonomous message from the device</li>  
+-              <li><a id="CUL_HM-attr-sabotageAttackId"><b>sabotageAttackId</b></a><br>
++              <li><a id="CUL_HM-attr-sabotageAttackId"></a><b>sabotageAttackId</b><br>
+                 Alarming configuration access to the device from a unknown source<br></li>
+-              <li><a id="CUL_HM-attr-sabotageAttack"><b>sabotageAttack</b></a><br>
++              <li><a id="CUL_HM-attr-sabotageAttack"></a><b>sabotageAttack</b><br>
+                 Alarming configuration access to the device that was not issued by our system<br></li>
+-              <li><a id="CUL_HM-attr-trigDst"><b>trigDst_&lt;name&gt;: noConfig</b></a><br>
++              <li><a id="CUL_HM-attr-trigDst"></a><b>trigDst_&lt;name&gt;: noConfig</b><br>
+                 A sensor triggered a Device which is not present in its peerList. Obviously the peerList is not up to date<br></li>
+            </ul>
+          </li>  
+@@ -13053,7 +13173,7 @@
+           [unlocked|locked|uncertain]<br>
+       </li>
+     </ul>
+-    <a id="CUL_HM-internals"><b>Internals</b></a>
++    <a id="CUL_HM-internals"></a><h4>Internals</h4>
+     <ul>
+       <li><B>aesCommToDev</B><br>
+         gives information about success or fail of AES communication between IO-device and HM-Device<br>
+@@ -13568,7 +13688,7 @@
+         <li>virtual<a id="CUL_HM-set-virtual"></a><br>
+           <ul>
+             <li><B><a href="#CUL_HM-set-peerChan">peerChan</a></B> siehe remote</li>
+-            <li><B><a id="CUL_HM-set-press"></a>press [long|short] [&lt;peer&gt;] [&lt;repCount&gt;] [&lt;repDelay&gt;] </B>
++            <li><a id="CUL_HM-set-press"></a><B>press [long|short] [&lt;peer&gt;] [&lt;repCount&gt;] [&lt;repDelay&gt;]</B>
+               <ul>
+                   Simuliert den Tastendruck am Aktor eines gepeerted Sensors
+                  <li>[long|short] soll ein langer oder kurzer Taastendrucl simuliert werden? Default ist kurz. </li>
+@@ -13577,15 +13697,15 @@
+                  <li>[&lt;repDelay&gt;] nur gueltig fuer long. definiert die Zeit zwischen den einzelnen Messages. </li>
+               </ul>  
+               </li>
+-            <li><B>virtTemp &lt;[off -10..50]&gt;<a id="CUL_HM-set-virtTemp"></a></B>
++            <li><a id="CUL_HM-set-virtTemp"></a><B>virtTemp &lt;[off -10..50]&gt;</B>
+               Simuliert ein Thermostat. Wenn mit einem Ger&auml;t gepeert wird periodisch eine Temperatur gesendet,
+               solange bis "off" gew&auml;hlt wird. Siehe auch <a href="#CUL_HM-set-virtHum">virtHum</a><br>
+             </li>
+-            <li><B>virtHum &lt;[off -10..50]&gt;<a id="CUL_HM-set-virtHum"></a></B>
++            <li><a id="CUL_HM-set-virtHum"></a><B>virtHum &lt;[off -10..50]&gt;</B>
+               Simuliert den Feuchtigkeitswert eines Thermostats. Wenn mit einem Ger&auml;t verkn&uuml;pft werden periodisch
+               Luftfeuchtigkeit undTemperatur gesendet, solange bis "off" gew&auml;hlt wird. Siehe auch <a href="#CUL_HM-set-virtTemp">virtTemp</a><br>
+             </li>
+-            <li><B>valvePos &lt;[off 0..100]&gt;<a id="CUL_HM-set-valvePos"></a></B>
++            <li><a id="CUL_HM-set-valvePos"></a><B>valvePos &lt;[off 0..100]&gt;</B>
+               steuert einen Ventilantrieb<br>
+             </li>
+           </ul>
+@@ -13760,12 +13880,12 @@
+               d&uuml;rfen in der Liste nicht benutzt werden.<br>
+               <b>replay</b> kann verwendet werden um den zuletzt gespielten Klang zu wiederholen.<br>
+               <b>repeat</b> definiert wie oft die Sequenz ausgef&uuml;hrt werden soll. Standard ist 1.<br>
+- 	      <b>volume</b> kann im Bereich 0..10 liegen. 0 stoppt jeden aktuell gespielten Sound. Standard ist 10 (100%.<br>
++          <b>volume</b> kann im Bereich 0..10 liegen. 0 stoppt jeden aktuell gespielten Sound. Standard ist 10 (100%.<br>
+               Beispiel:
+               <ul><code>
+                 set cfm_Mp3 playTone 3 # MP3 Titel 3 einmal<br>
+                 set cfm_Mp3 playTone 3 3 # MP3 Titel 3 dreimal<br>
+- 		set cfm_Mp3 playTone 3 1 5 # MP3 Titel 3 mit halber Lautst&auml;rke<br>
++    set cfm_Mp3 playTone 3 1 5 # MP3 Titel 3 mit halber Lautst&auml;rke<br>
+                 set cfm_Mp3 playTone 3,6,8,3,4 # MP3 Titelfolge 3,6,8,3,4 einmal<br>
+                 set cfm_Mp3 playTone 3,6,8,3,4 255# MP3 Titelfolge 3,6,8,3,4 255 mal<br>
+                 set cfm_Mp3 playTone replay # Wiederhole letzte Sequenz<br>
+@@ -14031,7 +14151,8 @@
+                </ul>
+            </li>
+     </ul><br>
+-    <a id="CUL_HM-attr"></a><b>Attribute</b>
++    <a id="CUL_HM-attr"></a>
++    <h4>Attribute</h4>
+     <ul>
+       <li><a href="#eventMap">eventMap</a></li>
+       <li><a href="#do_not_notify">do_not_notify</a></li>
+@@ -14039,10 +14160,10 @@
+       <li><a href="#dummy">dummy</a></li>
+       <li><a href="#showtime">showtime</a></li> 
+       <li><a href="#readingFnAttributes">readingFnAttributes</a></li>
+-      <li><a id="CUL_HM-attr-readingOnDead">readingOnDead</a><br>
++      <li><a id="CUL_HM-attr-readingOnDead"></a>readingOnDead<br>
+           definiert wie readings behandelt werden sollten wenn das Device als 'dead' mariert wird.<br>
+           Das Attribut ist nur auf Devices anwendbar. Es ändert die Readings wenn das Device nach dead geht. 
+-          Beim Verlasen des Zustandes 'dead' werden die ausgewählten Readings nach 'notDead' geändert. Es kann erwartet werden, dass sinnvolle Werte vom Device eingetragen werden.<br>          Upon leaving state 'dead' the selected readings will be set to 'notDead'. It is expected that useful values will be filled by the normally operating device.<br>
++          Beim Verlasen des Zustandes 'dead' werden die ausgewählten Readings nach 'notDead' geändert. Es kann erwartet werden, dass sinnvolle Werte vom Device eingetragen werden.<br>
+           Optionen sind:<br>
+           noChange: keine Readings ausser Actvity werden geändert. Andere Einträge werden ignoriert.<br>
+           state: das Reading 'state' wird auf 'dead' gesetzt.<br>
+@@ -14061,7 +14182,7 @@
+             attr myDevice readingOnDead state,deviceMsg,CommandAccepted # beim Eintreten in dead state,deviceMsg und CommandAccepted des Device werden, wenn verfuegbar, auf 'dead' gesetzt.<br>
+           </code></ul>           
+           </li>
+-      <li><a id="CUL_HM-attr-aesCommReq">aesCommReq</a><br>
++      <li><a id="CUL_HM-attr-aesCommReq"></a>aesCommReq<br>
+            wenn gesetzt wird IO AES signature anfordern bevor ACK zum Device gesendet wird.<br>
+       </li>
+       <li><a id="CUL_HM-attr-actAutoTry">actAutoTry</a><br>
+@@ -14069,7 +14190,7 @@
+          setzen erlaubt dem ActionDetector ein statusrequest zu senden falls das Device dead markiert werden soll.
+          Das Attribut kann f&uuml;r Devices n&uuml;tzlich sein, welche sich nicht von selbst zyklisch melden.
+       </li>
+-      <li><a id="CUL_HM-attr-actCycle">actCycle</a><br>
++      <li><a id="CUL_HM-attr-actCycle"></a>actCycle<br>
+         actCycle &lt;[hhh:mm]|off&gt;<br>
+         Bietet eine 'alive' oder besser 'not alive' Erkennung f&uuml;r Ger&auml;te. [hhh:mm] ist die maximale Zeit ohne Nachricht eines Ger&auml;ts. Wenn innerhalb dieser Zeit keine Nachricht empfangen wird so wird das Event"&lt;device&gt; is dead" generiert.
+         Sendet das Ger&auml;t wieder so wird die Nachricht"&lt;device&gt; is alive" ausgegeben. <br>
+@@ -14084,7 +14205,10 @@
+         Die gesamte Funktion kann &uuml;ber den "ActionDetector"-Eintrag &uuml;berpr&uuml;ft werden. Der Status aller Instanzen liegt im READING-Bereich.<br>
+         Hinweis: Diese Funktion kann ebenfalls f&uuml;r Ger&auml;te ohne zyklische &Uuml;bertragung aktiviert werden. Es obliegt dem Nutzer eine vern&uuml;nftige Zeitspanne festzulegen.
+       </li>
+-      <li><a id="CUL_HM-attr-autoReadReg">autoReadReg</a><br>
++      <li><a id="CUL_HM-attr-aesKey"></a>aesKey<br>
++          Spezifiziert, welcher aes key verwendet wird, falls <i>aesCommReq</i> aktiviert wird.<br>
++          </li>
++      <li><a id="CUL_HM-attr-autoReadReg"></a>autoReadReg<br>
+         '0' autoReadReg wird ignorert.<br>
+         '1' wird automatisch in getConfig ausgef&uuml;hrt f&uuml;r das Device nach jedem reboot von FHEM. <br>
+         '2' wie '1' plus nach Power on.<br>
+@@ -14100,7 +14224,7 @@
+           Das Setzen auf Level 5 wird f&uuml;r alle Devices und Typen empfohlen, auch wakeup Devices.<br>
+         </ul>
+         </li>
+-      <li><a id="CUL_HM-attr-burstAccess">burstAccess</a><br>
++      <li><a id="CUL_HM-attr-burstAccess"></a>burstAccess<br>
+         kann f&uuml;r eine Ger&auml;teinstanz gesetzt werden falls das Model bedingte Bursts erlaubt.
+         Das Attribut deaktiviert den Burstbetrieb (0_off) was die Nachrichtenmenge des HMLAN reduziert
+         und damit die Wahrscheinlichkeit einer &Uuml;berlast von HMLAN verringert.<br>
+@@ -14108,7 +14232,7 @@
+         bis das Ger&auml;t wach ist. <br>
+         Zu beachten ist, dass das Register "burstRx" im Ger&auml;t ebenfalls gesetzt werden muss.
+         </li>
+-      <li><a id="CUL_HM-attr-expert">expert</a><br>
++      <li><a id="CUL_HM-attr-expert"></a>expert<br>
+         Dieses Attribut steuert die Sichtbarkeit der Register Readngs. Damit wird die Darstellung der Ger&auml;teparameter kontrolliert.<br>
+         Es handdelt sich um einen binaer kodierten Wert mit folgenden Empfehlungen:<br>
+         <ul>
+@@ -14130,7 +14254,7 @@
+       <li><a id="CUL_HM-attr-readOnly">readOnly</a><br>
+           beschränkt kommandos auf Lesen und Beobachten.
+           </li>
+-      <li><a id="CUL_HM-attr-IOgrp">IOgrp</a><br>
++      <li><a id="CUL_HM-attr-IOgrp"></a>IOgrp<br>
+         kann an Devices vergeben werden und zeigt auf eine virtuelle VCCU. 
+         Das Setzen des Attributs führt zum Löschen des Attributs IODev da sich diese ausschliessen. 
+         Danach wird die VCCU
+@@ -14147,7 +14271,7 @@
+           attr myDevice2 IOgrp vccu:prefIO1,prefIO2,none<br>
+         </code></ul>
+         </li>
+-      <li><a id="CUL_HM-attr-levelRange">levelRange</a><br>
++      <li><a id="CUL_HM-attr-levelRange"></a>levelRange<br>
+         nur f&uuml;r Dimmer! Der Dimmbereich wird eingeschr&auml;nkt. 
+         Es ist gedacht um z.B. LED Lichter unterst&uuml;tzen welche mit 10% beginnen und bei 40% bereits das Maximum haben.
+         levelrange normalisiert den Bereich entsprechend. D.h. set 100 wird physikalisch den Dimmer auf 40%, 
+@@ -14165,31 +14289,31 @@
+           attr myChannel levelRange 10,80<br>
+         </code></ul>
+         </li>
+-      <li><a id="CUL_HM-attr-tempListTmpl">tempListTmpl</a><br>
++      <li><a id="CUL_HM-attr-tempListTmpl"></a>tempListTmpl<br>
+         Setzt das Default f&uuml;r Heizungskontroller. Ist es nicht gesetzt wird der default filename genutzt und der name
+         der entity als templatename. Z.B. ./tempList.cfg:RT_Clima<br> 
+-        Um das template nicht zu nutzen kann man es auf '0'setzen.<br>
++        Um das template nicht zu nutzen kann man es auf 'none' oder '0'setzen.<br>
+         Format ist &lt;file&gt;:&lt;templatename&gt;. 
+         </li>
+-      <li><a id="CUL_HM-attr-modelForce">modelForce</a><br>
++      <li><a id="CUL_HM-attr-modelForce"></a>modelForce<br>
+           modelForce überschreibt das model attribut. Dabei wird das Device und seine Kanäle reconfguriert.<br>
+           Grund für dieses Attribut ist ein eQ3 bug bei welchen Devices mit falscher ID ausgeliefert werden. Das Attribut
+           erlaubt dies zu ueberschreiben<br>
+           ACHTUNG: Durch das Eintragen eines anderen model werden die Entites modifiziert, ggf. neu angelegt oder gelöscht.<br>
+           </li>
+-      <li><a id="CUL_HM-attr-model">model</a><br>
++      <li><a id="CUL_HM-attr-model"></a>model<br>
+         wird automatisch gesetzt. </li>
+-      <li><a id="CUL_HM-attr-subType">subType</a><br>
++      <li><a id="CUL_HM-attr-subType"></a>subType<br>
+         wird automatisch gesetzt. </li>
+-      <li><a id="CUL_HM-attr-param">param</a><br>
++      <li><a id="CUL_HM-attr-param"></a>param<br>
+         'param' definiert modelspezifische Verhalten oder Funktionen. Siehe "models" f&uuml;r Details.</li>
+-      <li><a id="CUL_HM-attr-msgRepeat">msgRepeat</a><br>
++      <li><a id="CUL_HM-attr-msgRepeat"></a>msgRepeat<br>
+         Definiert die Nummer an Wiederholungen falls ein Ger&auml;t nicht rechtzeitig antwortet. <br>
+         F&uuml;r Ger&auml;te die nur den "Config"-Modus unterst&uuml;tzen sind Wiederholungen nicht erlaubt. <br>
+         Bei Ger&auml;te mit wakeup-Modus wartet das Ger&auml;t bis zum n&auml;chsten Aufwachen. Eine l&auml;ngere Verz&ouml;gerung
+         sollte in diesem Fall angedacht werden. <br>
+         Wiederholen von Bursts hat Auswirkungen auf die HMLAN &Uuml;bertragungskapazit&auml;t.</li>
+-      <li><a id="CUL_HM-attr-rawToReadable">rawToReadable</a><br>
++      <li><a id="CUL_HM-attr-rawToReadable"></a>rawToReadable<br>
+         Wird verwendet um Rohdaten von KFM100 in ein lesbares Fomrat zu bringen, basierend auf
+         den gemessenen Werten. Z.B. langsames F&uuml;llen eines Tanks, w&auml;hrend die Werte mit <a href="#inform">inform</a>
+         angezeigt werden. Man sieht:
+@@ -14202,11 +14326,11 @@
+         Anwenden dieser Werte: "attr KFM100 rawToReadable 10:0 50:20 79:40 270:100".
+         FHEM f&uuml;r damit eine lineare Interpolation der Werte in den gegebenen Grenzen aus.
+       </li>
+-      <li><a id="CUL_HM-attr-unit">unit</a><br>
++      <li><a id="CUL_HM-attr-unit"></a>unit<br>
+         setzt die gemeldete Einheit des KFM100 falls 'rawToReadable' aktiviert ist. Z.B.<br>
+         attr KFM100 unit Liter
+       </li>
+-      <li><a id="CUL_HM-attr-autoReadReg">autoReadReg</a><br>
++      <li><a id="CUL_HM-attr-autoReadReg"></a>autoReadReg<br>
+         '0' autoReadReg wird ignoriert.<br>
+         '1' f&uuml;hrt ein "getConfig" f&uuml;r ein Ger&auml;t automatisch nach jedem Neustart von FHEM aus. <br>
+         '2' verh&auml;lt sich wie '1',zus&auml;tzlich nach jedem power_on.<br>
+@@ -14228,7 +14352,7 @@
+         </ul>
+       </li>
+       </ul> <br>
+-    <a id="CUL_HM-attr-params"></a><b>verf&uuml;gbare Parameter f&uuml;r "param"</b>
++    <a id="CUL_HM-attr-params"></a><b>verfügbare Parameter für "param"</b>
+     <ul>
+       <li><B>HM-SEN-RD-O</B><br>
+         offAtPon: nur Heizkan&auml;le: erzwingt Ausschalten der Heizung nach einem powerOn<br>
+@@ -14237,7 +14361,7 @@
+       <li><B>virtuals</B><br> 
+         noOnOff: eine virtuelle Instanz wird den Status nicht &auml;ndern wenn ein Trigger empfangen wird. Ist dieser Paramter
+         nicht gegeben so toggled die Instanz ihren Status mit jedem trigger zwischen An und Aus<br>
+-        msgReduce: falls gesetzt und der Kanal wird f&uuml;r <a ref="CUL_HMvalvePos"></a> genutzt wird jede Nachricht
++        msgReduce: falls gesetzt und der Kanal wird für <a ref="CUL_HM-set-valvePos">valvePos</a> genutzt wird jede Nachricht
+         außer die der Ventilstellung verworfen um die Nachrichtenmenge zu reduzieren<br>
+       </li>
+       <li><B>blind</B><br>
+--- 98_HMinfo.svn.pm	2021-10-02 07:59:42.686162382 +0200
++++ 98_HMinfo.pm	2021-10-05 19:23:47.718450120 +0200
+@@ -1,6 +1,6 @@
+ ##############################################
+ ##############################################
+-# $Id: 98_HMinfo.pm 24960 2021-09-12 06:43:51Z martinp876 $
++# $Id: 98_HMinfo.pm 24960 2021-10-04 + cref + other + start HMinfo first Beta-User $
+ package main;
+ use strict;
+ use warnings;
+@@ -69,7 +69,8 @@
+                        .$readingFnAttributes;
+   $hash->{NOTIFYDEV} = "global";
+   $modules{HMinfo}{helper}{initDone} = 0;
+-  HMinfo_init();
++  $hash->{NotifyOrderPrefix} = "49-"; #Beta-User: make sure, HMinfo is up and running after CUL_HM but prior to user code e.g. in notify
++  #HMinfo_init(); #Beta-User: doppelt gemoppelt zu Define?
+ }
+ sub HMinfo_Define($$){#########################################################
+   my ($hash, $def) = @_;
+@@ -99,11 +100,14 @@
+   $hash->{nb}{cnt} = 0;
+   $modules{HMinfo}{helper}{initDone} = 0;
+   notifyRegexpChanged($hash,"global",0);
+-  HMinfo_init();
++  #HMinfo_init(); Beta-User: do this in NotifyFn to be sure, all CUL_HM entities are already defined and readings and attr are available
++  LoadModule('CUL_HM'); #Beta-User: Make sure, code from CUL_HM is available when attributes are set
+   return;
+ }
+ sub HMinfo_Undef($$){##########################################################
+   my ($hash, $name) = @_;
++  RemoveInternalTimer("sUpdt:".$name);
++  RemoveInternalTimer($name,"HMinfo_getCfgDefere");
+   return undef;
+ }
+ sub HMinfo_Attr(@) {###########################################################
+@@ -254,7 +258,7 @@
+   if (grep /(SAVE|SHUTDOWN)/,@{$events}){# also save configuration
+     HMinfo_archConfig($hash,$name,"","") if(AttrVal($name,"autoArchive",undef));
+   }
+-  if (grep /INITIALIZED/,@{$events}){
++  if (grep /INITIALIZED|REREADCFG/,@{$events}){
+     $modules{HMinfo}{helper}{initDone} = 0;
+     HMinfo_init();
+   }
+@@ -263,6 +267,7 @@
+ sub HMinfo_init(){#############################################################
+   RemoveInternalTimer("HMinfo_init");# just to be secure...
+   if ($init_done){
++    #Log3(undef,3,"debug: HMinfo_init");
+     if (!$modules{HMinfo}{helper}{initDone}){ # && !$modules{HMinfo}{helper}{initDone}){
+       my ($hm) = devspec2array("TYPE=HMinfo");
+       if (substr(AttrVal($hm, "autoLoadArchive", 0),0,1) ne 0){
+@@ -1887,11 +1892,11 @@
+         CUL_HM_Set($defs{$dName},$dName,"clear",$type);
+       }
+       $ret = $cmd.$type." done:" 
+-                       ."\n cleared"  
+-		       ."\n    ".(join "\n    ",sort @entities)
++	                   ."\n cleared"  
++					   ."\n    ".(join "\n    ",sort @entities)
+              if($filter);#  no return if no filter 
+     }
+-    HMinfo_status($hash);
++	HMinfo_status($hash);
+   }
+   elsif($cmd eq "autoReadReg"){##actionImmediate: re-issue register Read-------
+     my @entities;
+@@ -3398,15 +3403,19 @@
+ 
+ 
+ 1;
++
++__END__
++
+ =pod
++=encoding utf8
+ =item command
+ =item summary    support and control instance for wireless homematic devices and IOs
+-=item summary_DE Unterstützung und Ueberwachung von Homematic funk devices und IOs 
++=item summary_DE Unterstützung und Überwachung von Homematic Funk devices und IOs 
+ 
+ =begin html
+ 
+ 
+-<a name="HMinfo"></a>
++<a id="HMinfo"></a>
+ <h3>HMinfo</h3>
+ <ul>
+ 
+@@ -3415,7 +3424,7 @@
+   <B>Status information and counter</B><br>
+   HMinfo gives an overview on the CUL_HM installed base including current conditions.
+   Readings and counter will not be updated automatically  due to performance issues. <br>
+-  Command <a href="#HMinfoupdate">update</a> must be used to refresh the values. 
++  Command <a href="#HMinfo-set-update">update</a> must be used to refresh the values. 
+   <ul><code><br>
+            set hm update<br>
+   </code></ul><br>
+@@ -3425,8 +3434,8 @@
+       <li>Action Detector status</li>
+       <li>CUL_HM related IO devices and condition</li>
+       <li>Device protocol events which are related to communication errors</li>
+-      <li>count of certain readings (e.g. battery) and conditions - <a href="#HMinfoattr">attribut controlled</a></li>
+-      <li>count of error condition in readings (e.g. overheat, motorErr) - <a href="#HMinfoattr">attribut controlled</a></li>
++      <li>count of certain readings (e.g. battery) and conditions - <a href="#HMinfo-attr">attribut controlled</a></li>
++      <li>count of error condition in readings (e.g. overheat, motorErr) - <a href="#HMinfo-attr">attribut controlled</a></li>
+   </ul>
+   <br>
+ 
+@@ -3436,7 +3445,7 @@
+   Commands are executed on all HM entities.
+   If applicable and evident execution is restricted to related entities.
+   e.g. rssi is executed on devices only since channels do not support rssi values.<br><br>
+-  <a name="HMinfoFilter"><b>Filter</b></a>
++  <a id="HMinfo-Filter"></a><b>Filter</b>
+   <ul>  can be applied as following:<br><br>
+         <code>set &lt;name&gt; &lt;cmd&gt; &lt;filter&gt; [&lt;param&gt;]</code><br>
+         whereby filter has two segments, typefilter and name filter<br>
+@@ -3464,67 +3473,68 @@
+         </code></ul>
+   </ul>
+   <br>
+-  <a name="HMinfodefine"><b>Define</b></a>
++  <a id="HMinfo-define"><h4>Define</h4></a>
+   <ul>
+     <code>define &lt;name&gt; HMinfo</code><br>
+     Just one entity needs to be defined without any parameter.<br>
+   </ul>
+   <br>
+-  <a name="HMinfoget"><b>Get</b></a>
++  <a id="HMinfo-get"></a><h4>Get</h4>
+   <ul>
+-      <li><a name="#HMinfomodels">models</a><br>
++      <li><a id="HMinfo-get-models"></a>models<br>
+           list all HM models that are supported in FHEM
+       </li>
+-      <li><a name="#HMinfoparam">param</a> <a href="#HMinfoFilter">[filter]</a> &lt;name&gt; &lt;name&gt;...<br>
++      <li><a id="HMinfo-get-param"></a>param <a href="#HMinfo-Filter">[filter]</a> &lt;name&gt; &lt;name&gt;...<br>
+           returns a table of parameter values (attribute, readings,...)
+           for all entities as a table
+       </li>
+-      <li><a name="#HMinforegister">register</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-register"></a>register <a href="#HMinfo-Filter">[filter]</a><br>
+           provides a tableview of register of an entity
+       </li>
+-      <li><a name="#HMinforegCheck">regCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-regCheck"></a>regCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           performs a consistency check on register readings for completeness
+       </li>
+-      <li><a name="#HMinfopeerCheck">peerCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerCheck"></a>peerCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           performs a consistency check on peers. If a peer is set in a channel
+           it will check wether the peer also exist on the opposit side.
+       </li>
+-      <li><a name="#HMinfopeerUsg">peerUsg</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerUsg"></a>peerUsg <a href="#HMinfo-Filter">[filter]</a><br>
+           provides a cross-reference on peerings and assigned template information
+       </li>
+-      <li><a name="#HMinfopeerXref">peerXref</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerXref"></a>peerXref <a href="#HMinfo-Filter">[filter]</a><br>
+           provides a cross-reference on peerings, a kind of who-with-who summary over HM
+       </li>
+-      <li><a name="#HMinfoconfigCheck">configCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-configCheck"></a>configCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           performs a consistency check of HM settings. It includes regCheck and peerCheck
+       </li>
+-      <li><a name="#HMinfoconfigChkResult">configChkResult</a><br>
++      <li><a id="HMinfo-get-configChkResult"></a>configChkResult<br>
+           returns the results of a previous executed configCheck
+       </li>
+-      <li><a name="#HMinfotemplateList">templateList [&lt;name&gt;]</a><br>
++      <li><a id="HMinfo-get-templateList"></a>templateList [&lt;name&gt;]<br>
+           list defined templates. If no name is given all templates will be listed<br>
+       </li>
+-      <li><a name="#HMinfoconfigInfo">configInfo [&lt;name&gt;]</a><br>
++      <li><a id="HMinfo-get-configInfo"></a>configInfo [&lt;name&gt;]<br>
+           information to getConfig results<br>
+       </li>
+-      <li><a name="#HMinfotemplateUsg">templateUsg</a> &lt;template&gt; [sortPeer|sortTemplate]<br>
++      <li><a id="HMinfo-get-templateUsg" data-pattern="templateUsg.*"></a>templateUsg &lt;template&gt; [sortPeer|sortTemplate]<br>
+           templare usage<br>
+-          template filters the output
++          template filters the output<br>
++          <i>templateUsgG</i> (for all devices)
+       </li>
+-      <li><a name="#HMinfomsgStat">msgStat</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-msgStat"></a>msgStat <a href="#HMinfo-Filter">[filter]</a><br>
+           statistic about message transferes over a week<br>
+       </li>
+-      <li><a name="#HMinfoprotoEvents">protoEvents </a><a href="#HMinfoFilter">[filter]</a> <br>
++      <li><a id="HMinfo-get-protoEvents"></a>protoEvents <a href="#HMinfo-Filter">[filter]</a> <br>
+           <B>important view</B> about pending commands and failed executions for all devices in a single table.<br>
+           Consider to clear this statistic use <a name="#HMinfoclear">clear msgEvents</a>.<br>
+       </li>
+-      <li><a name="#HMinforssi">rssi </a><a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-rssi" data-pattern="rssi.*"></a>rssi <a href="#HMinfo-Filter">[filter]</a><br>
+           statistic over rssi data for HM entities.<br>
+       </li>
+ 
+-      <li><a name="#HMinfotemplateChk">templateChk</a> <a href="#HMinfoFilter">[filter]</a> &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
++      <li><a id="HMinfo-get-templateChk"></a>templateChk <a href="#HMinfo-Filter">[filter]</a> &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
+          verifies if the register-readings comply to the template <br>
+-         Parameter are identical to <a href="#HMinfotemplateSet">templateSet</a><br>
++         Parameter are identical to <a href="#HMinfo-set-templateSet">templateSet</a><br>
+          The procedure will check if the register values match the ones provided by the template<br>
+          If no peer is necessary use <b>none</b> to skip this entry<br>
+         Example to verify settings<br>
+@@ -3542,28 +3552,28 @@
+          set hm templateChk sortPeer                                 # all assigned templates sortiert nach Peer<br>
+         </code></ul>
+       </li>
+-      <li><a name="#HMinfoshowTimer">showTimer </a><br>
++      <li><a id="HMinfo-get-showTimer"></a>showTimer <br>
+           show all timer currently running at this point in time.<br>
+       </li>
+   </ul>
+-  <a name="HMinfoset"><b>Set</b></a>
++  <a id="HMinfo-set"></a><h4>Set</h4>
+   <ul>
+     Even though the commands are a get funktion they are implemented
+     as set to allow simple web interface usage<br>
+-      <li><a name="#HMinfoupdate">update</a><br>
++      <li><a id="HMinfo-set-update"></a>update<br>
+           updates HM status counter.
+       </li>
+ 
+-      <li><a name="#HMinfoautoReadReg">autoReadReg</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-set-autoReadReg"></a>autoReadReg <a href="#HMinfo-Filter">[filter]</a><br>
+           schedules a read of the configuration for the CUL_HM devices with attribut autoReadReg set to 1 or higher.
+       </li>
+-      <li><a name="#HMinfocmdRequestG">cmdRequestG</a> <br>
++      <li><a id="HMinfo-set-cmdRequestG"></a>cmdRequestG <br>
+           issues a status request to update the system and performs access check to devices<br>
+           ping: for one channel per CUL_HM device<br>
+           status: for all channels that suport statusRequest<br>
+           Ping will generate a message to the device. If not answered the device is unaccessible. Check protState for errors in case.
+       </li>
+-      <li><a name="#HMinfoclear">clear</a> <a href="#HMinfoFilter">[filter]</a> [msgEvents|readings|msgStat|register|rssi]<br>
++      <li><a id="HMinfo-set-clear" data-pattern="clear.*"></a>clear <a href="#HMinfo-Filter">[filter]</a> [msgEvents|readings|msgStat|register|rssi]<br>
+           executes a set clear ...  on all HM entities<br>
+           <ul>
+           <li>protocol relates to set clear msgEvents</li>
+@@ -3573,18 +3583,19 @@
+           <li>msgStat clear HM general message statistics</li>
+           <li>register clears all register-entries in readings</li>
+           </ul>
++          <i>clearG</i> (for all devices)
+       </li>
+-      <li><a name="#HMinfosaveConfig">saveConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          performs a save for all HM register setting and peers. See <a href="#CUL_HMsaveConfig">CUL_HM saveConfig</a>.<br>
+-          <a ref="#HMinfopurgeConfig">purgeConfig</a> will be executed automatically if the stored filesize exceeds 1MByte.<br>
++      <li><a id="HMinfo-set-saveConfig"></a>saveConfig <a href="#HMinfo-Filter">[filter] [&lt;file&gt;]</a><br>
++          performs a save for all HM register setting and peers. See <a href="#CUL_HM-set-saveConfig">CUL_HM saveConfig</a>.<br>
++          <a href="#HMinfo-set-purgeConfig"></a>purgeConfig will be executed automatically if the stored filesize exceeds 1MByte.<br>
+       </li>
+-      <li><a name="#HMinfoarchConfig">archConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          performs <a href="#HMinfosaveConfig">saveConfig</a> for entities that appeare to have achanged configuration.
++      <li><a id="HMinfo-set-archConfig"></a>archConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
++          performs <a href="#HMinfo-set-saveConfig"></a>saveConfig for entities that appeare to have achanged configuration.
+           It is more conservative that saveConfig since incomplete sets are not stored.<br>
+           Option -a force an archieve for all devices that have a complete set of data<br>
+       </li>
+-      <li><a name="#HMinfoloadConfig">loadConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          loads register and peers from a file saved by <a href="#HMinfosaveConfig">saveConfig</a>.<br>
++      <li><a id="HMinfo-set-loadConfig"></a>loadConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
++          loads register and peers from a file saved by <a href="#HMinfo-set-saveConfig">saveConfig</a>.<br>
+           It should be used carefully since it will add data to FHEM which cannot be verified. No readings will be replaced, only 
+           missing readings will be added. The command is mainly meant to be fill in readings and register that are 
+           hard to get. Those from devices which only react to config may not easily be read. <br>
+@@ -3592,21 +3603,21 @@
+           that can be read.<br>
+           The command will update FHEM readings and attributes. It will <B>not</B> reprogramm any device.
+       </li>
+-      <li><a name="#HMinfopurgeConfig">purgeConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
++      <li><a id="HMinfo-set-purgeConfig"></a>purgeConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
+           purge (reduce) the saved config file. Due to the cumulative storage of the register setting
+           purge will use the latest stored readings and remove older one. 
+-          See <a href="#CUL_HMsaveConfig">CUL_HM saveConfig</a>.
++          See <a href="#CUL_HM-set-saveConfig">CUL_HM saveConfig</a>.
+       </li>
+-      <li><a name="#HMinfoverifyConfig">verifyConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
++      <li><a id="HMinfo-set-verifyConfig"></a>verifyConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
+           Compare date in config file to the currentactive data and report differences. 
+           Possibly usable with a known-good configuration that was saved before. 
+           It may make sense to purge the config file before.
+-          See <a href="#CUL_HMpurgeConfig">CUL_HM purgeConfig</a>.
++          See <a href="#CUL_HM-set-purgeConfig">CUL_HM purgeConfig</a>.
+       </li>
+ 
+       
+          <br>
+-      <li><a name="#HMinfotempList">tempList</a> <a href="#HMinfoFilter">[filter] [save|restore|verify|status|genPlot] [&lt;file&gt;]</a><br>
++      <li><a id="HMinfo-set-tempList" data-pattern="tempList.*"></a>tempList <a href="#HMinfo-Filter">[filter]</a> [save|restore|verify|status|genPlot] [&lt;file&gt;]<br>
+           this function supports handling of tempList for thermstates.
+           It allows templists to be saved in a separate file, verify settings against the file
+           and write the templist of the file to the devices. <br>
+@@ -3655,12 +3666,13 @@
+          <li><B>entities</B> comma separated list of entities which refers to the temp lists following.
+            The actual entity holding the templist must be given - which is channel 04 for RTs or channel 02 for TCs</li>
+          <li><B>tempList...</B> time and temp couples as used in the set tempList commands</li>
+-         <li><B>simDev -model-</B> tsimulate a device</li>
++         <li><B>simDev -model-</B> simulate a device</li>
+          </ul>
++         <i>tempListG</i> (for all devices)
+          <br>
+      </li>
+          <br>
+-      <li><a name="#HMinfocpRegs">cpRegs &lt;src:peer&gt; &lt;dst:peer&gt; </a><br>
++      <li><a id="HMinfo-set-cpRegs"></a>cpRegs &lt;src:peer&gt; &lt;dst:peer&gt; <br>
+           allows to copy register, setting and behavior of a channel to
+           another or for peers from the same or different channels. Copy therefore is allowed
+           intra/inter device and intra/inter channel. <br>
+@@ -3681,7 +3693,7 @@
+            cpRegs expets that all <u>readings are up-to-date</u>. It is up to the user to ensure data consistency.<br>
+          </ul>
+       </li>
+-      <li><a name="#HMinfotemplateDef">templateDef &lt;name&gt; &lt;param&gt; &lt;desc&gt; &lt;reg1:val1&gt; [&lt;reg2:val2&gt;] ...</a><br>
++      <li><a id="HMinfo-set-templateDef"></a>templateDef &lt;name&gt; &lt;param&gt; &lt;desc&gt; &lt;reg1:val1&gt; [&lt;reg2:val2&gt;] ...<br>
+         define a template.<br>
+         <b>param</b> gives the names of parameter necesary to execute the template. It is template dependant
+                      and may be onTime or brightnesslevel. A list of parameter needs to be separated with colon<br>
+@@ -3701,7 +3713,7 @@
+           set hm templateDef SwOnCond fromMaster myChannel peerChannel:long  # <br>
+         </code></ul>
+       </li>
+-      <li><a name="#HMinfotemplateSet">templateSet</a> &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
++      <li><a id="HMinfo-set-templateSet"></a>templateSet &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
+          sets a bunch of register accroding to a given template. Parameter may be added depending on
+          the template setup. <br>
+          templateSet will collect and accumulate all changes. Finally the results are written streamlined.<br>
+@@ -3723,15 +3735,15 @@
+ 
+         </ul>
+       </li>
+-      <li><a name="#HMinfotemplateDel">templateDel</a> &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; ]<br>
++      <li><a id="HMinfo-set-templateDel"></a>templateDel &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; ]<br>
+          remove a template installed by templateSet
+           <br>
+ 
+       </li>
+-      <li><a name="#HMinfotemplateExe">templateExe</a> &lt;template&gt; <br>
++      <li><a id="HMinfo-set-templateExe"></a>templateExe &lt;template&gt; <br>
+           executes the register write once again if necessary (e.g. a device had a reset)<br>
+       </li>
+-      <li><a name="#HMinfodeviceReplace">x-deviceReplace</a> &lt;oldDevice&gt; &lt;newDevice&gt; <br>
++      <li><a id="HMinfo-set-deviceReplace">x-deviceReplace</a> &lt;oldDevice&gt; &lt;newDevice&gt; <br>
+           replacement of an old or broken device with a replacement. The replacement needs to be compatible - FHEM will check this partly. It is up to the user to use it carefully. <br>
+           The command needs to be executed twice for safety reasons. The first call will return with CAUTION remark. Once issued a second time the old device will be renamed, the new one will be named as the old one. Then all peerings, register and templates are corrected as best as posible. <br>
+           NOTE: once the command is executed devices will be reconfigured. This cannot be reverted automatically.  <br>
+@@ -3742,9 +3754,10 @@
+   <br>
+ 
+   <br><br>
+-  <a name="HMinfoattr"><b>Attributes</b></a>
++  <a id="HMinfo-attr"></a><h4>Attributes</h4>
+    <ul>
+-     <a name="sumStatus"><li>sumStatus</a><br>
++     <a id="HMinfo-attr-sumStatus"></a>
++     <li>sumStatus<br>
+        Warnings: list of readings that shall be screend and counted based on current presence.
+        I.e. counter is the number of entities with this reading and the same value.
+        Readings to be searched are separated by comma. <br>
+@@ -3759,7 +3772,8 @@
+        Note: counter with '0' value will not be reported. HMinfo will find all present values autonomously<br>
+        Setting is meant to give user a fast overview of parameter that are expected to be system critical<br>
+      </li>
+-     <a name="sumERROR"><li>sumERROR</a>
++     <a id="HMinfo-attr-sumERROR"></a>
++     <li>sumERROR<br>
+        Similar to sumStatus but with a focus on error conditions in the system.
+        Here user can add reading<b>values</b> that are <b>not displayed</b>. I.e. the value is the
+        good-condition that will not be counted.<br>
+@@ -3777,7 +3791,8 @@
+          ERR_Activity dead:5<br>
+        </code></ul>
+      </li>
+-     <a name="autoUpdate"><li>autoUpdate</a>
++     <a id="HMinfo-attr-autoUpdate"></a>
++     <li>autoUpdate<br>
+        retriggers the command update periodically.<br>
+        Example:<br>
+        <ul><code>
+@@ -3785,14 +3800,16 @@
+        </code></ul>
+        will trigger the update every 10 min<br>
+      </li>
+-     <a name="autoArchive"><li>autoArchive</a>
++     <a id="HMinfo-attr-autoArchive"></a>
++     <li>autoArchive<br>
+        if set fhem will update the configFile each time the new data is available.
+-       The update will happen with <a ref="#HMinfoautoUpdate">autoUpdate</a>. It will not 
++       The update will happen with <a href="#HMinfo-att-autoUpdate">autoUpdate</a>. It will not 
+        work it autoUpdate is not used.<br>
+-       see also <a ref="#HMinfoarchConfig">archConfig</a>
++       see also <a href="#HMinfo-attr-archConfig">archConfig</a>
+        <br>
+      </li>
+-     <a name="hmAutoReadScan"><li>hmAutoReadScan</a>
++     <a id="HMinfo-attr-hmAutoReadScan"></a>
++     <li>hmAutoReadScan<br>
+        defines the time in seconds CUL_HM tries to schedule the next autoRead
+        from the queue. Despite this timer FHEM will take care that only one device from the queue will be
+        handled at one point in time. With this timer user can stretch timing even further - to up to 300sec
+@@ -3800,52 +3817,60 @@
+        Setting to 1 still obeys the "only one at a time" prinzip.<br>
+        Note that compressing will increase message load while stretch will extent waiting time.<br>
+      </li>
+-     <a name="hmIoMaxDly"><li>hmIoMaxDly</a>
++     <a id="HMinfo-attr-hmIoMaxDly"></a>
++     <li>hmIoMaxDly<br>
+        max time in seconds CUL_HM stacks messages if the IO device is not ready to send.
+        If the IO device will not reappear in time all command will be deleted and IOErr will be reported.<br>
+        Note: commands will be executed after the IO device reappears - which could lead to unexpected
+        activity long after command issue.<br>
+        default is 60sec. max value is 3600sec<br>
+      </li>
+-     <a name="configDir"><li>configDir</a>
++     <a id="HMinfo-attr-configDir"></a>
++     <li>configDir<br>
+        default directory where to store and load configuration files from.
+        This path is used as long as the path is not given in a filename of 
+        a given command.<br>
+-       It is used by commands like <a ref="#HMinfotempList">tempList</a> or <a ref="#HMinfosaveConfig">saveConfig</a><br>
++       It is used by commands like <a href="#HMinfo-set-tempList">tempList</a> or <a href="#HMinfo-set-saveConfig">saveConfig</a><br>
+      </li>
+-     <a name="configFilename"><li>configFilename</a>
++     <a id="HMinfo-attr-configFilename"></a>
++     <li>configFilename<br>
+        default filename used by 
+-       <a ref="#HMinfosaveConfig">saveConfig</a>, 
+-       <a ref="#HMinfopurgeConfig">purgeConfig</a>, 
+-       <a ref="#HMinfoloadConfig">loadConfig</a><br>
+-       <a ref="#HMinfoverifyConfig">verifyConfig</a><br>
++       <a href="#HMinfo-set-saveConfig">saveConfig</a>, 
++       <a href="#HMinfo-set-purgeConfig">purgeConfig</a>, 
++       <a href="#HMinfo-set-loadConfig">loadConfig</a><br>
++       <a href="#HMinfo-set-verifyConfig">verifyConfig</a><br>
+      </li>
+-     <a name="configTempFile"><li>configTempFile&lt;;configTempFile2&gt;&lt;;configTempFile3&gt; </a>
++     <a id="HMinfo-attr-configTempFile"></a>
++     <li>configTempFile&lt;;configTempFile2&gt;&lt;;configTempFile3&gt;<br>
+         Liste of Templfiles (weekplan) which are considered in HMInfo and CUL_HM<br>
+         Files are comma separated. The first file is default. Its name may be skipped when setting a tempalte.<br>
+      </li>
+-     <a name="hmManualOper"><li>hmManualOper</a>
++     <a id="HMinfo-attr-hmManualOper"></a>
++     <li>hmManualOper<br>
+        set to 1 will prevent any automatic operation, update or default settings
+        in CUL_HM.<br>
+      </li>
+-     <a name="hmDefaults"><li>hmDefaults</a>
++     <a id="HMinfo-attr-hmDefaults"></a>
++     <li>hmDefaults<br>
+        set default params for HM devices. Multiple attributes are possible, comma separated.<br>
+        example:<br>
+        attr hm hmDefaults hmProtocolEvents:0_off,rssiLog:0<br>
+      </li>
+-     <a name="verbCULHM"><li>verbCULHM</a>
++     <a id="HMinfo-attr-verbCULHM"></a>
++     <li>verbCULHM<br>
+        set verbose logging for a special action for any CUL_HM entity.<br>
+        allSet: all set commands to be executed.<br>
+        allGet: all get requests to be executed.<br>
+      </li>
+-     <a name="autoLoadArchive"><li>autoLoadArchive</a>
+-       if set the register config will be loaded after reboot automatically. See <a ref="#HMinfoloadConfig">loadConfig</a> for details<br>
++     <a id="HMinfo-attr-autoLoadArchive"></a>
++     <li>autoLoadArchive<br>
++       if set the register config will be loaded after reboot automatically. See <a href="#HMinfo-set-loadConfig">loadConfig</a> for details<br>
+      </li>
+      
+ 
+    </ul>
+    <br>
+-  <a name="HMinfovariables"><b>Variables</b></a>
++  <a id="HMinfo-variables"></a><b>Variables</b>
+    <ul>
+      <li><b>I_autoReadPend:</b> Info:list of entities which are queued to retrieve config and status.
+                              This is typically scheduled thru autoReadReg</li>
+@@ -3864,11 +3889,11 @@
+      <li><b>C_sumDefined:</b> Count:defined entities in CUL_HM. Entites might be count as
+          device AND channel if channel funtion is covered by the device itself. Similar to virtual</li>
+      <li><b>ERR_&lt;reading&gt;:</b> Error:count of readings as defined in attribut
+-         <a href="#HMinfosumERROR">sumERROR</a>
++         <a href="#HMinfo-attr-sumERROR">sumERROR</a>
+          that do not match the good-content. </li>
+      <li><b>ERR_names:</b> Error:name-list of entities that are counted in any ERR_&lt;reading&gt;
+          W_sum_&lt;reading&gt;: count of readings as defined in attribut
+-         <a href="#HMinfosumStatus">sumStatus</a>. </li>
++         <a href="#HMinfo-attr-sumStatus">sumStatus</a>. </li>
+      Example:<br>
+ 
+      <ul><code>
+@@ -3889,7 +3914,7 @@
+ 
+ =begin html_DE
+ 
+-<a name="HMinfo"></a>
++<a id="HMinfo"></a>
+ <h3>HMinfo</h3>
+ <ul>
+ 
+@@ -3897,7 +3922,7 @@
+   <B>Status Informationen und Z&auml;hler</B><br>
+   HMinfo gibt einen &Uuml;berlick &uuml;ber CUL_HM Installationen einschliesslich aktueller Zust&auml;nde.
+   Readings und Z&auml;hler werden aus Performance Gr&uuml;nden nicht automatisch aktualisiert. <br>
+-  Mit dem Kommando <a href="#HMinfoupdate">update</a> k&ouml;nnen die Werte aktualisiert werden.
++  Mit dem Kommando <a href="#HMinfo-set-update">update</a> k&ouml;nnen die Werte aktualisiert werden.
+   <ul><code><br>
+            set hm update<br>
+   </code></ul><br>
+@@ -3906,8 +3931,8 @@
+       <li>Action Detector Status</li>
+       <li>CUL_HM Ger&auml;te und Zust&auml;nde</li>
+       <li>Ereignisse im Zusammenhang mit Kommunikationsproblemen</li>
+-      <li>Z&auml;hler f&uuml;r bestimmte Readings und Zust&auml;nde (z.B. battery) - <a href="#HMinfoattr">attribut controlled</a></li>
+-      <li>Z&auml;hler f&uuml;r Readings, die auf Fehler hindeuten (z.B. overheat, motorErr) - <a href="#HMinfoattr">attribut controlled</a></li>
++      <li>Z&auml;hler f&uuml;r bestimmte Readings und Zust&auml;nde (z.B. battery) - <a href="#HMinfo-attr">attribut controlled</a></li>
++      <li>Z&auml;hler f&uuml;r Readings, die auf Fehler hindeuten (z.B. overheat, motorErr) - <a href="#HMinfo-attr">attribut controlled</a></li>
+   </ul>
+   <br>
+ 
+@@ -3916,7 +3941,7 @@
+   Ein Kommando wird f&uuml;r alle HM Instanzen der kompletten Installation ausgef&uuml;hrt.
+   Die Ausf&uuml;hrung ist jedoch auf die dazugeh&ouml;rigen Instanzen beschr&auml;nkt.
+   So wird rssi nur auf Ger&auml;te angewendet, da Kan&auml;le RSSI Werte nicht unterst&uuml;tzen.<br><br>
+-  <a name="HMinfoFilter"><b>Filter</b></a>
++  <a id="HMinfo-Filter"><b>Filter</b></a>
+   <ul> werden wie folgt angewendet:<br><br>
+         <code>set &lt;name&gt; &lt;cmd&gt; &lt;filter&gt; [&lt;param&gt;]</code><br>
+         wobei sich filter aus Typ und Name zusammensetzt<br>
+@@ -3944,68 +3969,68 @@
+         </code></ul>
+   </ul>
+   <br>
+-  <a name="HMinfodefine"><b>Define</b></a>
++  <a id="HMinfo-define"><b>Define</b></a>
+   <ul>
+     <code>define &lt;name&gt; HMinfo</code><br>
+     Es muss nur eine Instanz ohne jegliche Parameter definiert werden.<br>
+   </ul>
+   <br>
+-  <a name="HMinfoget"><b>Get</b></a>
++  <a id="HMinfo-get"></a><h4>Get</h4>
+   <ul>
+-      <li><a name="#HMinfomodels">models</a><br>
++      <li><a id="HMinfo-get-models"></a>models<br>
+           zeige alle HM Modelle an, die von FHEM unterst&uuml;tzt werden
+       </li>
+-      <li><a name="#HMinfoparam">param</a> <a href="#HMinfoFilter">[filter]</a> &lt;name&gt; &lt;name&gt;...<br>
++      <li><a id="HMinfo-get-param"></a>param <a href="#HMinfo-Filter">[filter]</a> &lt;name&gt; &lt;name&gt;...<br>
+           zeigt Parameterwerte (Attribute, Readings, ...) f&uuml;r alle Instanzen in Tabellenform an 
+       </li>
+-      <li><a name="#HMinforegister">register</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-register"></a>register <a href="#HMinfo-Filter">[filter]</a><br>
+           zeigt eine Tabelle mit Registern einer Instanz an
+       </li>
+-      <li><a name="#HMinforegCheck">regCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-regCheck"></a>regCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           validiert Registerwerte
+       </li>
+-      <li><a name="#HMinfopeerCheck">peerCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerCheck"></a>peerCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           validiert die Einstellungen der Paarungen (Peers). Hat ein Kanal einen Peer gesetzt, muss dieser auch auf
+           der Gegenseite gesetzt sein.
+       </li>
+-      <li><a name="#HMinfopeerUsg">peerUsg</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerUsg"></a>peerUsg <a href="#HMinfo-Filter">[filter]</a><br>
+           erzeugt eine komplette Querverweisliste aller Paarungen und die Nutzung der Templates
+       </li>
+-      <li><a name="#HMinfopeerXref">peerXref</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-peerXref"></a>peerXref <a href="#HMinfo-Filter">[filter]</a><br>
+           erzeugt eine komplette Querverweisliste aller Paarungen (Peerings)
+       </li>
+-      <li><a name="#HMinfoconfigCheck">configCheck</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-configCheck"></a>configCheck <a href="#HMinfo-Filter">[filter]</a><br>
+           Plausibilit&auml;tstest aller HM Einstellungen inklusive regCheck und peerCheck
+       </li>
+-      <li><a name="#HMinfoconfigChkResult">configChkResult</a><br>
++      <li><a id="HMinfo-get-configChkResult"></a>configChkResult<br>
+           gibt das Ergebnis eines vorher ausgeführten configCheck zurück
+       </li>
+-      <li><a name="#HMinfotemplateList">templateList [&lt;name&gt;]</a><br>
++      <li><a id="HMinfo-get-templateList"></a>templateList [&lt;name&gt;]<br>
+           zeigt eine Liste von Vorlagen. Ist kein Name angegeben, werden alle Vorlagen angezeigt<br>
+       </li>
+-      <li><a name="#HMinfoconfigInfo">configInfo [&lt;name&gt;]</a><br>
++      <li><a id="HMinfo-get-configInfo"></a>configInfo [&lt;name&gt;]<br>
+           Informationen zu getConfig einträgen<br>
+       </li>
+-      <li><a name="#HMinfotemplateUsg">templateUsg</a> &lt;template&gt; [sortPeer|sortTemplate]<br>
+-          Liste der genutzten templates.<br>
+-          template filtert die Einträge nach diesem template
++      <li><a id="HMinfo-get-templateUsg" data-pattern="templateUsg.*"></a>templateUsg &lt;template&gt; [sortPeer|sortTemplate]<br>
++          template filtert die Einträge nach diesem template<br>
++          <i>templateUsgG</i> (für alle Geräte)
+       </li>
+-      <li><a name="#HMinfomsgStat">msgStat</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-msgStat"></a>msgStat <a href="#HMinfo-Filter">[filter]</a><br>
+           zeigt eine Statistik aller Meldungen der letzen Woche<br>
+       </li>
+-      <li><a name="#HMinfoprotoEvents">protoEvents</a> <a href="#HMinfoFilter">[filter]</a> <br>
++      <li><a id="HMinfo-get-protoEvents"></a>protoEvents <a href="#HMinfo-Filter">[filter]</a> <br>
+           vermutlich die <B>wichtigste Auflistung</B> f&uuml;r Meldungsprobleme.
+           Informationen &uuml;ber ausstehende Kommandos und fehlgeschlagene Sendevorg&auml;nge
+           f&uuml;r alle Ger&auml;te in Tabellenform.<br>
+           Mit <a name="#HMinfoclear">clear msgEvents</a> kann die Statistik gel&ouml;scht werden.<br>
+       </li>
+-      <li><a name="#HMinforssi">rssi </a><a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-get-rssi" data-pattern="rssi.*"></a>rssi <a href="#HMinfo-Filter">[filter]</a><br>
+           Statistik &uuml;ber die RSSI Werte aller HM Instanzen.<br>
+       </li>
+ 
+-      <li><a name="#HMinfotemplateChk">templateChk</a> <a href="#HMinfoFilter">[filter]</a> &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
++      <li><a id="HMinfo-get-templateChk"></a>templateChk <a href="#HMinfo-Filter">[filter]</a> &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
+          Verifiziert, ob die Registerwerte mit der Vorlage in Einklang stehen.<br>
+-         Die Parameter sind identisch mit denen aus <a href="#HMinfotemplateSet">templateSet</a>.<br>
++         Die Parameter sind identisch mit denen aus <a href="#HMinfo-set-templateSet">templateSet</a>.<br>
+          Wenn kein Peer ben&ouml;tigt wird, stattdessen none verwenden.
+          Beispiele f&uuml;r die &Uuml;berpr&uuml;fung von Einstellungen<br>
+         <ul><code>
+@@ -4022,25 +4047,28 @@
+          set hm templateChk sortPeer                                 # all assigned templates, sort by peer<br>
+         </code></ul>
+       </li>
++      <li><a id="HMinfo-get-showTimer"></a>showTimer <br>
++          Zeigt alle derzeit laufenden Timer an.<br>
++      </li>
+   </ul>
+-  <a name="HMinfoset"><b>Set</b></a>
++  <a id="HMinfo-set"></a><h4>Set</h4>
+   <ul>
+   Obwohl die Kommandos Einstellungen abrufen (get function), werden sie mittels set ausgef&uuml;hrt, um die 
+   Benutzung mittels Web Interface zu erleichtern.<br>
+     <ul>
+-      <li><a name="#HMinfoupdate">update</a><br>
++      <li><a id="HMinfo-set-update"></a>update<br>
+           Aktualisiert HM Status Z&auml;hler.
+       </li>
+-      <li><a name="#HMinfoautoReadReg">autoReadReg</a> <a href="#HMinfoFilter">[filter]</a><br>
++      <li><a id="HMinfo-set-autoReadReg"></a>autoReadReg <a href="#HMinfo-Filter">[filter]</a><br>
+           Aktiviert das automatische Lesen der Konfiguration f&uuml;r ein CUL_HM Ger&auml;t, wenn das Attribut autoReadReg auf 1 oder h&ouml;her steht.
+       </li>
+-      <li><a name="#HMinfocmdRequestG">cmdRequestG</a> <br>
++      <li><a id="HMinfo-set-cmdRequestG"></a>cmdRequestG <br>
+           commando cmdRequestG wird an alle Entites verschickt um einen update zu erzwingen und die Zugriffe zu prüfen.<br>
+           Das Kommando geht nur an Entites, welche auch statusRequest unterstützen. <br>
+           ping: es wird an einen der kanäle ein status request verschickt<br>
+           status: jede entity welche das kommando unterstützt wird angesprochen<br>
+       </li>
+-      <li><a name="#HMinfoclear">clear</a> <a href="#HMinfoFilter">[filter]</a> [msgEvents|msgErrors|readings|msgStat|register|rssi]<br>
++      <li><a id="HMinfo-set-clear" data-pattern="clear.*"></a>clear <a href="#HMinfo-Filter">[filter]</a> [msgEvents|readings|msgStat|register|rssi]<br>
+           F&uuml;hrt ein set clear ... f&uuml;r alle HM Instanzen aus<br>
+           <ul>
+           <li>Protocol bezieht sich auf set clear msgEvents</li>
+@@ -4051,17 +4079,17 @@
+           <li>register l&ouml;scht alle Eintr&auml;ge in den Readings</li>
+           </ul>
+       </li>
+-      <li><a name="#HMinfosaveConfig">saveConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          Sichert alle HM Registerwerte und Peers. Siehe <a href="#CUL_HMsaveConfig">CUL_HM saveConfig</a>.<br>
+-          <a ref="#HMinfopurgeConfig">purgeConfig</a> wird automatisch ausgef&uuml;hrt, wenn die Datenmenge 1 MByte &uuml;bersteigt.<br>
++      <li><a id="HMinfo-set-saveConfig"></a>saveConfig <a href="#HMinfo-Filter">[filter] [&lt;file&gt;]</a><br>
++          Sichert alle HM Registerwerte und Peers. Siehe <a href="#CUL_HM-get-saveConfig">CUL_HM saveConfig</a>.<br>
++          <a href="#HMinfo-set-purgeConfig">purgeConfig</a> wird automatisch ausgef&uuml;hrt, wenn die Datenmenge 1 MByte &uuml;bersteigt.<br>
+       </li>
+-      <li><a name="#HMinfoarchConfig">archConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          F&uuml;hrt <a href="#HMinfosaveConfig">saveConfig</a> f&uuml;r alle Instanzen aus, sobald sich deren Konfiguration &auml;ndert.
++      <li><a id="HMinfo-set-archConfig"></a>archConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
++          F&uuml;hrt <a href="#HMinfo-set-saveConfig">saveConfig</a> f&uuml;r alle Instanzen aus, sobald sich deren Konfiguration &auml;ndert.
+           Es schont gegen&uuml;ber saveConfig die Resourcen, da es nur vollst&auml;ndige Konfigurationen sichert.<br>
+           Die Option -a erzwingt das sofortige Archivieren f&uuml;r alle Ger&auml;te, die eine vollst&auml;ndige Konfiguration aufweisen.<br>
+       </li>
+-      <li><a name="#HMinfoloadConfig">loadConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          L&auml;dt Register und Peers aus einer zuvor mit <a href="#HMinfosaveConfig">saveConfig</a> gesicherten Datei.<br>
++      <li><a id="HMinfo-set-loadConfig"></a>loadConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
++          L&auml;dt Register und Peers aus einer zuvor mit <a href="#HMinfo-set-saveConfig">saveConfig</a> gesicherten Datei.<br>
+           Es sollte mit Vorsicht verwendet werden, da es Daten zu FHEM hinzuf&uuml;gt, die nicht verifiziert sind.
+           Readings werden nicht ersetzt, nur fehlende Readings werden hinzugef&uuml;gt. Der Befehl ist dazu geignet, um Readings
+           zu erstellen, die schwer zu erhalten sind. Readings von Ger&auml;ten, die nicht dauerhaft empfangen sondern nur auf Tastendruck
+@@ -4070,20 +4098,20 @@
+           die einfach ausgelesen werden k&ouml;nnen.<br>
+           Der Befehl aktualisiert lediglich FHEM Readings und Attribute. Die Programmierung des Ger&auml;tes wird <B>nicht</B> ver&auml;ndert.
+       </li>
+-      <li><a name="#HMinfopurgeConfig">purgeConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
++      <li><a id="HMinfo-set-purgeConfig"></a>purgeConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
+           Bereinigt die gespeicherte Konfigurationsdatei. Durch die kumulative Speicherung der Registerwerte bleiben die
+           zuletzt gespeicherten Werte erhalten und alle &auml;lteren werden gel&ouml;scht.
+-          Siehe <a href="#CUL_HMsaveConfig">CUL_HM saveConfig</a>.
++          Siehe <a href="#CUL_HM-get-saveConfig">CUL_HM saveConfig</a>.
+       </li>
+-      <li><a name="#HMinfoverifyConfig">verifyConfig</a> <a href="#HMinfoFilter">[filter] [&lt;file&gt;]</a><br>
+-          vergleicht die aktuellen Daten mit dem configFile und zeigt unterschiede auf. 
+-          Es ist hilfreich wenn man eine bekannt gute Konfiguration gespeichert hat und gegen diese vergleiche will.
+-          Ein purge vorher macht sinn. 
+-          Siehe <a href="#CUL_HMpurgeConfig">CUL_HM purgeConfig</a>.
++      <li><a id="HMinfo-set-verifyConfig"></a>verifyConfig <a href="#HMinfo-Filter">[filter]</a> [&lt;file&gt;]<br>
++          Vergleicht die aktuellen Daten mit dem configFile und zeigt Unterschiede auf. 
++          Es ist hilfreich wenn man eine bekannt gute Konfiguration gespeichert hat und gegen diese vergleichen will.
++          Ein purge vorher macht Sinn. 
++          Siehe <a href="#CUL_HM-set-purgeConfig">CUL_HM purgeConfig</a>.
+       </li>
+       <br>
+       
+-      <li><a name="#HMinfotempList">tempList</a> <a href="#HMinfoFilter">[filter]</a>[save|restore|verify] [&lt;file&gt;]</a><br>
++      <li><a id="HMinfo-set-tempList" data-pattern="tempList.*"></a>tempList <a href="#HMinfo-Filter">[filter]</a> [save|restore|verify|status|genPlot] [&lt;file&gt;]<br>
+           Diese Funktion erm&ouml;glicht die Verarbeitung von tempor&auml;ren Temperaturlisten f&uuml;r Thermostate.
+           Die Listen k&ouml;nnen in Dateien abgelegt, mit den aktuellen Werten verglichen und an das Ger&auml;t gesendet werden.<br>
+           <li><B>save</B> speichert die aktuellen tempList Werte des Systems in eine Datei. <br>
+@@ -4131,7 +4159,7 @@
+          <br>
+      </li>
+          <br>
+-      <li><a name="#HMinfocpRegs">cpRegs &lt;src:peer&gt; &lt;dst:peer&gt; </a><br>
++      <li><a id="HMinfo-set-cpRegs"></a>cpRegs &lt;src:peer&gt; &lt;dst:peer&gt; <br>
+           erm&ouml;glicht das Kopieren von Registern, Einstellungen und Verhalten zwischen gleichen Kan&auml;len, bei einem Peer auch
+           zwischen unterschiedlichen Kan&auml;len. Das Kopieren kann daher sowohl von Ger&auml;t zu Ger&auml;t, als auch innerhalb eines
+           Ger&auml;tes stattfinden.<br>
+@@ -4153,7 +4181,7 @@
+          cpRegs erwartet <u>aktuelle Readings</u>. Dies muss der Benutzer sicher stellen.<br>
+          </ul>
+       </li>
+-      <li><a name="#HMinfotemplateDef">templateDef &lt;name&gt; &lt;param&gt; &lt;desc&gt; &lt;reg1:val1&gt; [&lt;reg2:val2&gt;] ...</a><br>
++      <li><a id="HMinfo-set-templateDef"></a>templateDef &lt;name&gt; &lt;param&gt; &lt;desc&gt; &lt;reg1:val1&gt; [&lt;reg2:val2&gt;] ...<br>
+           definiert eine Vorlage.<br>
+           <b>param</b> definiert die Namen der Parameters, die erforderlich sind, um die Vorlage auszuf&uuml;hren.
+                        Diese sind abh&auml;ngig von der Vorlage und k&ouml;nnen onTime oder brightnesslevel sein.
+@@ -4173,7 +4201,7 @@
+           set hm templateDef SwOnCond fromMaster myChannel peerChannel:long  <br>
+         </code></ul>
+       </li>
+-      <li><a name="#HMinfotemplateSet">templateSet</a> &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
++      <li><a id="HMinfo-set-templateSet"></a>templateSet &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; [&lt;param1&gt; ...]<br>
+           setzt mehrere Register entsprechend der angegebenen Vorlage. Die Parameter m&uuml;ssen entsprechend der Vorlage angegeben werden.<br>
+           templateSet akkumuliert alle &Auml;nderungen und schreibt das Ergebnis gesammelt.<br>
+          <b>entity:</b> ist die Quell-Instanz. Der Peer muss angegeben werden, wenn dessen Verhalten kopiert werden soll.<br>
+@@ -4193,13 +4221,13 @@
+          <br>
+         </ul>
+       </li>
+-      <li><a name="#HMinfotemplateDel">templateDel</a> &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt;<br>
++      <li><a id="HMinfo-set-templateDel"></a>templateDel &lt;entity&gt; &lt;template&gt; &lt;peer:[long|short]&gt; ]<br>
+           entfernt ein Template das mit templateSet eingetragen wurde
+       </li>
+-      <li><a name="#HMinfotemplateExe">templateExe</a> &lt;template&gt; <br>
++      <li><a id="HMinfo-set-templateExe"></a>templateExe &lt;template&gt; <br>
+           führt das templateSet erneut aus. Die Register werden nochmals geschrieben, falls sie nicht zum template passen. <br>
+       </li>
+-      <li><a name="#HMinfodeviceReplace">x-deviceReplace</a> &lt;oldDevice&gt; &lt;newDevice&gt; <br>
++      <li><a id="#HMinfo-set-deviceReplace">x-deviceReplace</a> &lt;oldDevice&gt; &lt;newDevice&gt; <br>
+           Ersetzen eines alten oder defekten Device. Das neue Ersatzdevice muss kompatibel zum Alten sein - FHEM prüft das nur rudimentär. Der Anwender sollt es sorgsam prüfen.<br>
+           Das Kommando muss aus Sicherheitsgründen 2-fach ausgeführt werden. Der erste Aufruf wird mit einem CAUTION quittiert. Nach Auslösen den Kommandos ein 2. mal werden die Devices umbenannt und umkonfiguriert. Er werden alle peerings, Register und Templates im neuen Device UND allen peers umgestellt.<br>
+           ACHTUNG: Nach dem Auslösen kann die Änderung nicht mehr automatisch rückgängig gemacht werden. Manuell ist das natürlich möglich.<br> 
+@@ -4212,9 +4240,10 @@
+   <br>
+ 
+ 
+-  <a name="HMinfoattr"><b>Attribute</b></a>
++  <a id="HMinfo-attr"></a><h4>Attribute</h4>
+    <ul>
+-    <a name="sumStatus"><li>sumStatus</a><br>
++    <a id="HMinfo-attr-sumStatus"></a>
++    <li>sumStatus<br>
+         erzeugt eine Liste von Warnungen. Die zu untersuchenden Readings werden mittels Komma separiert angegeben.
+         Die Readings werden, so vorhanden, von allen Instanzen ausgewertet, gez&auml;hlt und getrennt nach Readings mit
+         gleichem Inhalt ausgegeben.<br>
+@@ -4229,7 +4258,8 @@
+         Anmerkung: Z&auml;hler mit Werten von '0' werden nicht angezeigt. HMinfo findet alle vorhanden Werte selbstst&auml;ndig.<br>
+         Das Setzen des Attributes erm&ouml;glicht einen schnellen &Uuml;berblick &uuml;ber systemkritische Werte.<br>
+     </li>
+-    <a name="sumERROR"><li>sumERROR</a>
++    <a id="HMinfo-attr-sumERROR"></a>
++     <li>sumERROR<br>
+         &Auml;hnlich sumStatus, jedoch mit dem Fokus auf signifikante Fehler.
+         Hier k&ouml;nnen Reading <b>Werte</b> angegeben werden, die dazu f&uuml;hren, dass diese <b>nicht angezeigt</b> werden.
+         Damit kann beispielsweise verhindert werden, dass der zu erwartende Normalwert oder ein anderer nicht
+@@ -4246,7 +4276,8 @@
+         ERR_Activity dead:5<br>
+         </code></ul>
+     </li>
+-    <a name="autoUpdate"><li>autoUpdate</a>
++    <a id="HMinfo-attr-autoUpdate"></a>
++     <li>autoUpdate<br>
+         f&uuml;hrt den Befehl periodisch aus.<br>
+         Beispiel:<br>
+         <ul><code>
+@@ -4254,62 +4285,73 @@
+         </code></ul>
+         f&uuml;hrt den Befehl alle 10 Minuten aus<br>
+     </li>
+-     <a name="autoArchive"><li>autoArchive</a>
++     <a id="HMinfo-attr-autoArchive"></a>
++     <li>autoArchive<br>
+         Sobald neue Daten verf&uuml;gbar sind, wird das configFile aktualisiert.
+-        F&uuml;r die Aktualisierung ist <a ref="#HMinfoautoUpdate">autoUpdate</a> zwingend erforderlich.<br>
+-        siehe auch <a ref="#HMinfoarchConfig">archConfig</a>
++        F&uuml;r die Aktualisierung ist <a href="#HMinfo-attr-autoUpdate">autoUpdate</a> zwingend erforderlich.<br>
++        siehe auch <a href="#HMinfo-attr-archConfig">archConfig</a>
+         <br>
+      </li>
+-     <a name="hmAutoReadScan"><li>hmAutoReadScan</a>
++     <a id="HMinfo-attr-hmAutoReadScan"></a>
++     <li>hmAutoReadScan<br>
+         definiert die Zeit in Sekunden bis zum n&auml;chsten autoRead durch CUL_HM. Trotz dieses Zeitwertes stellt
+         FHEM sicher, dass zu einem Zeitpunkt immer nur ein Ger&auml;t gelesen wird, auch wenn der Minimalwert von 1
+         Sekunde eingestellt ist. Mit dem Timer kann der Zeitabstand
+         ausgeweitet werden - bis zu 300 Sekunden zwischen zwei Ausf&uuml;hrungen.<br>
+         Das Herabsetzen erh&ouml;ht die Funkbelastung, Heraufsetzen erh&ouml;ht die Wartzezeit.<br>
+      </li>
+-     <a name="hmIoMaxDly"><li>hmIoMaxDly</a>
++     <a id="HMinfo-attr-hmIoMaxDly"></a>
++     <li>hmIoMaxDly<br>
+         maximale Zeit in Sekunden f&uuml;r die CUL_HM Meldungen puffert, wenn das Ger&auml;t nicht sendebereit ist.
+         Ist das Ger&auml;t nicht wieder rechtzeitig sendebereit, werden die gepufferten Meldungen verworfen und
+         IOErr ausgel&ouml;st.<br>
+         Hinweis: Durch die Pufferung kann es vorkommen, dass Aktivit&auml;t lange nach dem Absetzen des Befehls stattfindet.<br>
+         Standard ist 60 Sekunden, maximaler Wert ist 3600 Sekunden.<br>
+      </li>
+-     <a name="configDir"><li>configDir</a>
++     <a id="HMinfo-attr-configDir"></a>
++     <li>configDir<br>
+         Verzeichnis f&uuml;r das Speichern und Lesen der Konfigurationsdateien, sofern in einem Befehl nur ein Dateiname ohne
+         Pfad angegen wurde.<br>
+-        Verwendung beispielsweise bei <a ref="#HMinfotempList">tempList</a> oder <a ref="#HMinfosaveConfig">saveConfig</a><br>
++        Verwendung beispielsweise bei <a href="#HMinfo-set-tempList">tempList</a> oder <a href="#HMinfo-set-saveConfig">saveConfig</a><br>
+      </li>
+-     <a name="configFilename"><li>configFilename</a>
++     <a id="HMinfo-attr-configFilename"></a>
++     <li>configFilename<br>
+         Standard Dateiname zur Verwendung von 
+-        <a ref="#HMinfosaveConfig">saveConfig</a>, 
+-        <a ref="#HMinfopurgeConfig">purgeConfig</a>, 
+-        <a ref="#HMinfoloadConfig">loadConfig</a><br>
++        <a href="#HMinfo-set-saveConfig">saveConfig</a>, 
++       <a href="#HMinfo-set-purgeConfig">purgeConfig</a>, 
++       <a href="#HMinfo-set-loadConfig">loadConfig</a><br>
++       <a href="#HMinfo-set-verifyConfig">verifyConfig</a><br>
+      </li>
+-     <a name="configTempFile"><li>configTempFile&lt;;configTempFile2&gt;&lt;;configTempFile3&gt; </a>
++     <a id="HMinfo-attr-configTempFile"></a>
++     <li>configTempFile&lt;;configTempFile2&gt;&lt;;configTempFile3&gt; </a>
+         Liste der Templfiles (weekplan) welche in HM berücksichtigt werden<br>
+         Die Files werden kommasepariert eingegeben. Das erste File ist der Default. Dessen Name muss beim Template nicht eingegeben werden.<br>
+      </li>
+-     <a name="hmManualOper"><li>hmManualOper</a>
++     <a id="HMinfo-attr-hmManualOper"></a>
++     <li>hmManualOper<br>
+         auf 1 gesetzt, verhindert dieses Attribut jede automatische Aktion oder Aktualisierung seitens CUL_HM.<br>
+      </li>
+-     <a name="hmDefaults"><li>hmDefaults</a>
++     <a id="HMinfo-attr-hmDefaults"></a>
++     <li>hmDefaults<br>
+        setzt default Atribute fuer HM devices. Mehrere Attribute sind moeglich, Komma separiert.<br>
+        Beispiel:<br>
+        attr hm hmDefaults hmProtocolEvents:0_off,rssiLog:0<br>
+      </li>
+-     <a name="verbCULHM"><li>verbCULHM</a>
+-       set verbose logging fuer ausgewaehlte aktionen von allen CUL_HM entities.<br>
++     <a id="HMinfo-attr-verbCULHM"></a>
++     <li>verbCULHM<br>
++       Setzt das verbose logging für ausgewählte Aktionen von allen CUL_HM entities.<br>
+        allSet: alle set Kommandos fertig zur Ausführung.<br>
+        allGet: alle get Anfragen fertig zur Ausführung.<br>
+      </li>
+-     <a name="autoLoadArchive"><li>autoLoadArchive</a>
+-       das Register Archive sowie Templates werden nach reboot automatischgeladen.
+-       Siehe <a ref="#HMinfoloadConfig">loadConfig</a> fuer details<br>
++     <a id="HMinfo-attr-autoLoadArchive"></a>
++     <li>autoLoadArchive<br>
++       das Register Archive sowie Templates werden nach reboot automatisch geladen.
++       Siehe <a href="#HMinfo-set-loadConfig">loadConfig</a> für Details.<br>
+      </li>
+ 
+    </ul>
+    <br>
+-  <a name="HMinfovariables"><b>Variablen</b></a>
++  <a id="HMinfo-variables"><b>Variablen</b></a>
+    <ul>
+     <li><b>I_autoReadPend:</b> Info: Liste der Instanzen, f&uuml;r die das Lesen von Konfiguration und Status ansteht,
+                                      &uuml;blicherweise ausgel&ouml;st durch autoReadReg.</li>
+@@ -4328,10 +4370,10 @@
+     <li><b>C_sumDefined:</b> Count: In CUL_HM definierte Instanzen. Instanzen k&ouml;nnen als Ger&auml;t UND
+                                     als Kanal gez&auml;hlt werden, falls die Funktion des Kanals durch das Ger&auml;t
+                                     selbst abgedeckt ist. &Auml;hnlich virtual</li>
+-    <li><b>ERR_&lt;reading&gt;:</b> Fehler: Anzahl mittels Attribut <a href="#HMinfosumERROR">sumERROR</a>
++    <li><b>ERR_&lt;reading&gt;:</b> Fehler: Anzahl mittels Attribut <a href="#HMinfo-attr-sumERROR">sumERROR</a>
+                                            definierter Readings, die nicht den Normalwert beinhalten. </li>
+     <li><b>ERR_names:</b> Fehler: Namen von Instanzen, die in einem ERR_&lt;reading&gt; enthalten sind.</li>
+-    <li><b>W_sum_&lt;reading&gt;</b> Warnung: Anzahl der mit Attribut <a href="#HMinfosumStatus">sumStatus</a> definierten Readings.</li>
++    <li><b>W_sum_&lt;reading&gt;</b> Warnung: Anzahl der mit Attribut <a href="#HMinfo-attr-sumStatus">sumStatus</a> definierten Readings.</li>
+     Beispiele:<br>
+     <ul>
+     <code>

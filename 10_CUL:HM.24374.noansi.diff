@@ -1,0 +1,1006 @@
+--- 10_CUL_HM.24374	2021-05-02 20:16:52.000000000 +0200
++++ 10_CUL_HM.24374.noansi	2021-10-08 06:18:12.199930219 +0200
+@@ -2,6 +2,7 @@
+ ##############################################
+ # CUL HomeMatic handler
+ # $Id: 10_CUL_HM.pm 24374 2021-05-02 18:16:52Z martinp876 $
++# noansi: modified for testing
+ 
+ package main;
+ 
+@@ -79,13 +80,13 @@
+ sub CUL_HM_Get($@);
+ sub CUL_HM_Set($@);
+ sub CUL_HM_valvePosUpdt(@);
+-sub CUL_HM_infoUpdtDevData($$$);
++sub CUL_HM_infoUpdtDevData($$$$);
+ sub CUL_HM_infoUpdtChanData(@);
+ sub CUL_HM_getConfig($);
+ sub CUL_HM_SndCmd($$);
+ sub CUL_HM_responseSetup($$);
+ sub CUL_HM_eventP($$);
+-sub CUL_HM_protState($$);
++sub CUL_HM_protState($$;$);
+ sub CUL_HM_respPendRm($);
+ sub CUL_HM_respPendTout($);
+ sub CUL_HM_respPendToutProlong($);
+@@ -264,6 +265,7 @@
+   }
+   if ($type eq "startUp"){# only once after startup
+     $mIdReverse = 1 if (scalar keys %{$culHmModel2Id});
++    my $tn = TimeNow();
+     my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
+     foreach my $name  (@hmdev){
+       if ($attr{$name}{subType} && $attr{$name}{subType} eq "virtual"){
+@@ -280,14 +282,32 @@
+       CUL_HM_updtDeviceModel($name,AttrVal($name,"modelForce",AttrVal($name,"model","")),1) if($attr{$name}{".mId"});
+       # update IOdev
+       delete($attr{$name}{IOList}) if (AttrVal($name,"model","") ne "CCU-FHEM");
+-      CUL_HM_Attr("set",$name,"IOgrp",AttrVal($name,"IOgrp","")) if(AttrVal($name,"IOgrp","") ne "");# update helper by set attr again
+       my $h = $defs{$name};
++      $h->{helper}{prt}{sleeping} = 1 if (CUL_HM_getRxType($h) & 0x10);
+       delete $h->{helper}{io}{restoredIO} if (   defined($h->{helper}{io})
+                                               && defined($h->{helper}{io}{restoredIO})
+                                               && !defined($defs{$h->{helper}{io}{restoredIO}})); # cleanup undefined restored IO
+-      if (!CUL_HM_operIObyIOHash($h->{IODev})) { # noansi: assign IO, if no currently operational IO assigned
++      CUL_HM_Attr("set",$name,"IOgrp",AttrVal($name,"IOgrp","")) if(AttrVal($name,"IOgrp","") ne "");# update helper by set attr again
++      if ($h->{DEF} ne "000000") {
++        if (eval "defined(&TSCUL_RestoreHMDev)") {
++          my $restoredIOname = TSCUL_RestoreHMDev($h, $h->{DEF}); # noansi: restore IODev from TSCUL before the first CUL_HM_assignIO
++                                                                  #         here all IOs are defined, so we need to cleanup at least
++                                                                  #         as fhem.pl assigned an IO allready, we normally do not get a restored IO here
++                                                                  #         as we don't know definitely, if the IO was used allready, we should not simply delete it here
++          if (defined($restoredIOname)) {
++            $h->{IODev}                  = $defs{$restoredIOname};
++            $h->{READINGS}{IODev}{VAL}   = $restoredIOname; # noansi: first choice with vccu not set
++            $h->{helper}{io}{restoredIO} = $restoredIOname; # noansi: until attributes are filled, this should be the first choice
++          }
++        }
++        my $startio = defined($h->{READINGS}{IODev}) ? $h->{READINGS}{IODev}{VAL} : undef;
++        @{$h->{helper}{mRssi}{io}{$startio}} = (100,100) if ($startio); # noansi: set IO high rssi for first autoassign
+         CUL_HM_assignIO($h);
++        $h->{READINGS}{IODev}{TIME} = $tn if ($h->{READINGS}{IODev}{VAL}); #noansi: let it work correctly on next start
++                                                                           #        but a time will be set on save of state, so not strictly required
+         delete($h->{IODev}{'.clientArray'}) if ($h->{IODev}); # Force a recompute
++        Log3 $h, 0, "CUL_HM hint: $name first CUL_HM_assignIO differs from fhem.pl restore" #noansi: log to see, if IODev reading may get different to restored IO
++          if ($startio && $startio ne $h->{READINGS}{IODev}{VAL});
+       }
+     }
+   }
+@@ -313,6 +333,8 @@
+       $attr{$name}{model}   = $culHmModel->{"0000"}{name};
+       $attr{$name}{subType} = $culHmModel->{"0000"}{st};
+       delete $hash->{IODev};
++      delete $hash->{READINGS}{IODev};
++      delete $hash->{helper}{mRssi};
+       delete $hash->{helper}{role};
+       delete $attr{$name}{$_}
+             foreach ( "autoReadReg","actStatus","burstAccess","serialNr"
+@@ -623,6 +645,7 @@
+     $hash->{helper}{role}{dev}   = 1;
+     delete $hash->{helper}{mId};
+     delete $hash->{helper}{rxType};
++    delete $hash->{helper}{io}{supWu};
+     $hash->{helper}{role}{chn}   = 1;# take role of chn 01 until it is defined
+     $hash->{helper}{q}{qReqConf} = ""; # queue autoConfig requests 
+     $hash->{helper}{q}{qReqStat} = ""; # queue statusRequest for this device
+@@ -637,15 +660,17 @@
+         && $HMid ne "000000") {
+       if (eval "defined(&TSCUL_RestoreHMDev)") {
+         my $restoredIOname = TSCUL_RestoreHMDev($hash, $HMid); # noansi: restore IODev from TSCUL before the first CUL_HM_assignIO
++                                                               #         here not all IOs may be defined allready, but we can try to restore as no IO is set
++                                                               #         restore is working best, if IOs are defined first in cfg
+         if (defined($restoredIOname)) {
+           $hash->{IODev}                                 = $defs{$restoredIOname};
+-          $attr{$name}{IODev}                            = $restoredIOname;
++          $hash->{READINGS}{IODev}{VAL}                  = $restoredIOname; # noansi: first choice with vccu not set
+           $hash->{helper}{io}{restoredIO}                = $restoredIOname; # noansi: until attributes are filled, this should be the first choice
+           @{$hash->{helper}{mRssi}{io}{$restoredIOname}} = (100,100);       # noansi: set IO high rssi for first autoassign
+         }
+       }
+-      CUL_HM_assignIO($hash) if (!$hash->{IODev}); # noansi: assign IO, if no IO restored
+-      delete($hash->{IODev}{'.clientArray'}) if ($hash->{IODev}); # Force a recompute
++      # fhem.pl will set an IO from reading/attr IODev or AssignIoPort at end of init, we can not avoid and can not assign correctly
++      #         but with reading IOdev fhem.pl will restore the IO unsed before normal restart
+     }
+   }
+ 
+@@ -976,6 +1001,19 @@
+     else{                    $hash->{protCondBurst} = "forced_off";}
+     delete $hash->{helper}{rxType}; # needs new calculation
+   }
++  elsif($attrName eq "IODev") {
++    if ($cmd eq "set") {
++      return "use $attrName for devices only" if (!$hash->{helper}{role}{dev});
++      if (   $modules{CUL_HM}{helper}{initDone}
++          && $attrVal
++          && defined($defs{$attrVal})) {
++        return 'CUL_HM '.$name.': Non suitable IODev '.$attrVal.' specified'
++            if ($defs{$attrVal}->{TYPE} !~ m/^(?:HMLAN|HMUARTLGW|TSCUL|TSSTACKED|CUL|STACKABLE_CC)$/s);
++        $hash->{helper}{io}{restoredIO} = $attrVal; # noansi: first choice on next CUL_HM_assignIO, forced by user
++                                                    # noansi: we can not use CUL_HM_assignIO, as IODev will be set later to attrVal
++      }
++    }
++  }
+   elsif($attrName eq "IOList"){
+     # my $ios = ":".join(",",devspec2array("TYPE=(TSCUL|CUL|HMLAN|HMUARTLGW)"));
+     # $modules{CUL_HM}{AttrList}  =~ s/IOList.*? /IOList$ios /;
+@@ -1003,6 +1041,7 @@
+           if ($init_done){@prefIOA = grep /.+/,map{$defs{$_} || $_ eq 'none' ? $_ : ""} split(",",$prefIO);} 
+           else           {@prefIOA =                                                    split(",",$prefIO);}#check is possible after init. Assume correct if not finished
+           $hash->{helper}{io}{prefIO} = \@prefIOA if (int(@prefIOA));
++          CUL_HM_assignIO($hash) if ($modules{CUL_HM}{helper}{initDone}); #noansi: only after CUL_HM init is complete
+           my $attrValAssamble = "$ioCCU:".join(",",@prefIOA);
+           if ($attrVal ne $attrValAssamble){# original setting not possible
+             $attr{$name}{$attrName} = $attrValAssamble;
+@@ -1231,10 +1270,10 @@
+                              && AttrVal($name,"model",0) !~ m/HM-WDS100-C6-O/) #Todo - not completely clear how it works - O and O2
+                                  ?2:0;
+   $hash->{helper}{io}{p} = \@p;
+-  CUL_HM_hmInitMsgUpdt($hash);
++  CUL_HM_hmInitMsgUpdt($hash, $hash->{helper}{io}{flgs} ? $hash->{helper}{io}{flgs} & 0x02 : 0); #noansi: preserve wakeup preparation
+ }
+-sub CUL_HM_hmInitMsgUpdt($){ #update device init msg for HMLAN
+-  my ($hash)=@_;
++sub CUL_HM_hmInitMsgUpdt($;$){ #update device init msg for HMLAN
++  my ($hash, $wakeupPrep)=@_;
+   return if (  $hash->{helper}{role}{vrt}
+              ||!defined $hash->{helper}{io}{p});
+   my $oldChn = $hash->{helper}{io}{newChn};
+@@ -1244,7 +1283,11 @@
+   # it will force HMLAN to send A112 (have data). HMLAN will return 
+   # status "81" ACK if the device answers the A112 - FHEM should start sending Data by then
+   # 
+-  if($hash->{helper}{prt}{sProc} && $hash->{cmdStack}){
++  if (   $wakeupPrep                      #noansi: prepare wakeup
++      || (   $hash->{cmdStack}
++          && $hash->{helper}{prt}{sProc}
++          && !$hash->{helper}{io}{supWu}) #noansi: suppressing flag for wakeup handling
++     ){
+     $hash->{helper}{io}{flgs} = hex($p[1]) | $hash->{helper}{io}{rxt};
+   }
+   else{
+@@ -1253,12 +1296,20 @@
+   }
+   $p[1] = sprintf("%02X", $hash->{helper}{io}{flgs});
+   $hash->{helper}{io}{newChn} = '+'.join(",",@p);
+-  if ((  $hash->{helper}{io}{newChn} ne $oldChn)
+-      && $hash->{IODev}
+-      && $hash->{IODev}->{TYPE}
+-      && (   $hash->{IODev}->{helper}{VTS_AES} # for TSCUL VTS0.14 up
+-          || $hash->{IODev}->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/ )) {
+-    IOWrite($hash, "", "init:$p[0]");
++  if (   $wakeupPrep
++      || (   $hash->{helper}{io}{newChn} ne $oldChn
++          && $hash->{IODev} )
++      ) {
++    if (   $hash->{IODev}->{helper}{VTS_AES} # for TSCUL VTS0.14 up
++        || (   $hash->{IODev}->{TYPE}
++            && $hash->{IODev}->{TYPE} =~ m/^(?:HMLAN|HMUARTLGW)$/s )) {
++      IOWrite($hash, "", "init:$p[0]");
++    }
++    else {
++      if ($hash->{helper}{io}{flgs} & 0x02) { $hash->{helper}{io}{sendWu} = 1;     } #noansi: for CUL
++      else                                  { delete($hash->{helper}{io}{sendWu}); }
++    }
++    CUL_HM_syncIOassign($hash); #noansi: remove assignment from unassigned IOs, as some assign themselfs automatically on just sending a message
+   }
+ }
+ 
+@@ -1375,7 +1426,8 @@
+     $mh{devH} = CUL_HM_id2Hash($mh{src}); #sourcehash - changed to channel entity
+     $mh{devH}->{IODev} = $iohash;
+     if (!$modules{CUL_HM}{helper}{hmManualOper}){
+-      $attr{$sname}{IODev} = $mh{ioName};
++      $mh{devH}->{READINGS}{IODev}{VAL} = $mh{ioName};
++      $mh{devH}->{READINGS}{IODev}{TIME} = TimeNow();
+       my $ioOwn = InternalVal($mh{ioName},'owner_CCU','');
+       if ($ioOwn) {
+         $attr{$sname}{IOgrp} = $ioOwn;
+@@ -1573,6 +1625,9 @@
+               ||!($mh{mFlgH} & 0x20)) { #response required Flag
+           $doAES = 0;
+         }
++        else {
++          $doAES = 0; #noansi: no channel, no AES... or chn 00?
++        }
+       } 
+       elsif ($mh{mTp} =~ m/^0[23]/) {
+         $doAES = 0;
+@@ -1600,7 +1655,8 @@
+           $mh{devH}->{helper}{aesCommRq}{challenge} = $challenge;
+           $mh{devH}->{helper}{aesCommRq}{kNo} = $kNo;
+ 
+-          my $cmd = "$mh{mNo}A002$mh{dst}$mh{src}04${challenge}".sprintf("%02X", $kNo*2);
++#          my $cmd = "$mh{mNo}A002$mh{dst}$mh{src}04${challenge}".sprintf("%02X", $kNo*2);
++          my $cmd = $mh{mNo}.($mh{devH}->{helper}{io}{sendWu}?'A1':'A0').'02'.$mh{dst}.$mh{src}.'04'.$challenge.sprintf("%02X", $kNo*2); #noansi: wakeup for CUL AES
+           $cmd = sprintf("As%02X%s", length($cmd)/2, $cmd);
+           IOWrite($mh{devH}, "", $cmd);
+           $mh{msgStat}="AESpending";
+@@ -1680,7 +1736,13 @@
+ 
+   # +++++ check for duplicate or repeat ++++
+   my $msgX = "No:$mh{mNo} - t:$mh{mTp} s:$mh{src} d:$mh{dst} ".($mh{p}?$mh{p}:"");
+-  if($mh{devH}->{lastMsg} && $mh{devH}->{lastMsg} eq $msgX) { #duplicate -lost 'ack'?
++  if (   defined($mh{devH}->{lastMsg})
++      && $mh{devH}->{lastMsg} eq $msgX
++      && (   $mh{mTp} ne '00' #noansi: maybe for other message types a dupe timeout may help, too, not to block?
++          || (($mh{devH}->{helper}{lastMsgTm}+6) > $mh{rectm}) ) #noansi: user repeated config message may come with same mNo -> identical
++                                                                 #        but this blocks e.g. getConfig with unintended config press before
++                                                                 #        so an other device message is required to proceed
++      ) { #duplicate -lost 'ack'?
+            
+     if(   $mh{devH}->{helper}{rpt}                           #was responded
+        && $mh{devH}->{helper}{rpt}{IO}  eq $mh{ioName}           #from same IO
+@@ -1692,23 +1754,15 @@
+       $mh{devH}->{helper}{rpt}{ts} = $mh{rectm};
+       if (scalar(@{$ack})) {
+         my $i = 0;
+-        my $wulzy =    defined($mh{devH}->{helper}{io}{flgs})
+-                    && ($mh{devH}->{helper}{io}{flgs} & 0x02)
+-                    && $mh{devH}->{cmdStack}
+-                    && scalar @{$mh{devH}->{cmdStack}}; #noansi: wakeup replacement required
+         my ($h, $m);
+         while ($i < scalar(@{$ack})) {
+           $h = ${$ack}[$i++];
+           $m = ${$ack}[$i++];
+           if ($mh{devH}->{helper}{aesAuthBytes}) {
+             $m .= $mh{devH}->{helper}{aesAuthBytes} if (!(   $mh{devH}->{IODev}->{helper}{VTS_AES} # tsculfw does default ACK automatically only. A default ACK may just update a default ACK in tsculfw buffer
+-                                                          && ($m =~ m/^..(..)02/s))); # append auth bytes to first answer to device after sign from device
++                                                          && ($m =~ m/^....02/s))); # append auth bytes to first answer to device after sign from device
+             delete($mh{devH}->{helper}{aesAuthBytes});
+           }
+-          if ($wulzy && ($m =~ m/^..(..)02/s)) { #noansi: wakeup replacement for acks
+-            my $flr = sprintf("%02X", hex($1)|0x01);
+-            $m =~ s/^(..)../$1$flr/s; #noansi: wakeup replacement
+-          }
+           CUL_HM_SndCmd($h, $m);
+         }
+         Log3 $mh{devN},4,"CUL_HM $mh{devN} dupe: repeat ".scalar(@{$ack})." ack, dont process";
+@@ -1738,7 +1792,8 @@
+     return;
+   }
+   
+-  $mh{devH}->{lastMsg} = $msgX;# is used in parseCommon  and need previous setting. so set it here
++  $mh{devH}->{lastMsg}           = $msgX;# is used in parseCommon  and need previous setting. so set it here
++  $mh{devH}->{helper}{lastMsgTm} = $mh{rectm};
+ 
+   push @evtEt,[$mh{devH},1,"powerOn:$mh{tmStr}"] if($parse eq "powerOn");
+   push @evtEt,[$mh{devH},1,""]            if($parse eq "parsed"); # msg is parsed but may
+@@ -3027,7 +3082,17 @@
+     }
+ 
+     if($ioId eq $mh{dst} && ($mh{mFlgH}&0x20)){  # Send Ack/Nack
+-      push @ack,$mh{shash},$mh{mNo}."8002".$ioId.$mh{src}.($mh{mFlg}.$mh{mTp} eq "A001" ? "80":"00");
++#      push @ack,$mh{shash},$mh{mNo}."8002".$ioId.$mh{src}.($mh{mFlg}.$mh{mTp} eq "A001" ? "80":"00");
++      if ($mh{mFlg}.$mh{mTp} eq 'A001') {
++        push @ack,$mh{shash},$mh{mNo}.'8002'.$ioId.$mh{src}.'80';
++      }
++      else {
++        push @ack,$mh{shash},$mh{mNo}.'8002'.$ioId.$mh{src}.'00'  #noansi: additional CUL ACK
++            if (   $ioId eq $mh{dst}
++                && !$mh{wakupAck} #noansi: not if wakeup is sent
++                && !$mh{devH}->{IODev}->{helper}{VTS_ACK} # for TSCUL VTS0.17 up
++                && $mh{devH}->{IODev}->{TYPE} !~ m/^(?:HMLAN|HMUARTLGW)$/s ); #noansi: additional CUL ACK 
++      }
+     }
+   }
+   elsif($mh{st} eq "threeStateSensor") { ######################################
+@@ -3054,10 +3119,11 @@
+       $mh{shash} = $modules{CUL_HM}{defptr}{"$mh{src}$chn"}
+                              if($modules{CUL_HM}{defptr}{"$mh{src}$chn"});
+       push @evtEt,[$mh{devH},1,"battery:". ($err?"low"  :"ok"  )];
+-      push @ack,$mh{shash},$mh{mNo}."8002".$mh{dst}.$mh{src}."00"
++      push @ack,$mh{shash},$mh{mNo}."8002".$mh{dst}.$mh{src}."00"  #noansi: additional CUL ACK
+         if (   $ioId eq $mh{dst}
++            && !$mh{wakupAck} #noansi: not if wakeup is sent
+             && !$mh{devH}->{IODev}->{helper}{VTS_ACK}
+-            && $mh{devH}->{IODev}->{TYPE} !~ m/^(HMLAN|HMUARTLGW)$/); #noansi: additional CUL ACK 
++            && $mh{devH}->{IODev}->{TYPE} !~ m/^(HMLAN|HMUARTLGW)$/ );
+     }
+     if (defined($state)){# if state was detected post events
+       my $txt;
+@@ -3209,12 +3275,19 @@
+     else{
+       $sendAck = 1;
+     }
+-    push @ack,$mh{dstH},$mh{mNo}."8002".$mh{dst}.$mh{src}."00" if ($mh{mFlgH} & 0x20 && (!scalar(@ack)) && $sendAck && defined($mh{dstH}));
++    if (   $mh{mFlgH} & 0x20
++        && (!scalar(@ack))
++        && $sendAck
++        && defined($mh{dstH})) {
++      push @ack,$mh{dstH},$mh{mNo}."8002".$mh{dst}.$mh{src}."00";
++    }
+   }
+   elsif($ioId eq $mh{dst}){# if fhem is destination check if we need to react
+     if(   $mh{mTp} =~ m/^4./    #Push Button event
+        && !$mh{AckDone}          #noansi: allready done device specific
+-       && ($mh{mFlgH} & 0x20)){  #response required Flag
++       && ($mh{mFlgH} & 0x20)    #response required Flag
++       && !$mh{wakupAck}         #noansi: not if wakeup is sent
++       ){
+                 # fhem CUL shall ack a button press
+       if ($mh{md} =~ m/^(HM-SEC-SC.*|ROTO_ZEL-STG-RM-FFK)$/){# SCs - depending on FW version - do not accept ACK only. Especially if peered
+         push @ack,$mh{shash},$mh{mNo}."8002".$mh{dst}.$mh{src}."0101".((hex($mI[0])&1)?"C8":"00")."00";
+@@ -3232,6 +3305,7 @@
+   push @ack,$mh{shash}, $mh{mNo}."8002".$ioId.$mh{src}."00"
+       if(   ($ioId eq $mh{dst})   #are we adressee
+          && ($mh{mFlgH} & 0x20)   #response required Flag
++         && !$mh{wakupAck}        #noansi: not if wakeup is sent
+          && @evtEt            #only ack if we identified it
+          && (!scalar(@ack))   #sender requested ACK
+          );
+@@ -3242,10 +3316,6 @@
+     $mh{devH}->{helper}{rpt}{flg} = substr($mh{msg},5,1);
+     $mh{devH}->{helper}{rpt}{ack} = \@ack;
+     $mh{devH}->{helper}{rpt}{ts}  = $mh{rectm};
+-    my $wulzy =    defined($mh{devH}->{helper}{io}{flgs})
+-                && ($mh{devH}->{helper}{io}{flgs} & 0x02)
+-                && $mh{devH}->{cmdStack}
+-                && scalar @{$mh{devH}->{cmdStack}}; #noansi: wakeup replacement required
+     my ($h, $m);
+     my $i = 0;
+     while ($i < scalar(@ack)) {
+@@ -3256,10 +3326,6 @@
+                                                       && ($m =~ m/^..(..)02/s))); # append auth bytes to first answer to device after sign from device
+         delete($mh{devH}->{helper}{aesAuthBytes});
+       }
+-      if ($wulzy && ($m =~ m/^..(..)02/s)) { #noansi: wakeup replacement for acks
+-        my $flr = sprintf("%02X", hex($1)|0x01);
+-        $m =~ s/^(..)../$1$flr/s; #noansi: wakeup replacement
+-      }
+       CUL_HM_SndCmd($h, $m);
+     }
+     $respRemoved = $rr;
+@@ -3297,51 +3363,71 @@
+   $devHlpr->{HM_CMDNR} = hex($mhp->{mNo});# sync msgNo prior to any sending
+   if ($mhp->{mFlgH} & 0x02) { # wakeup signal
+     if ($mhp->{mFlgH} & 0x20) { # &0x22== 0x22 wakeup signal in lazy config device manner
+-      if    ($rxt & 0x10) { #lazy config device
++      if    ($rxt & 0x10) { #lazy config device as configured in HMConfig
+         if ($devHlpr->{prt}{sleeping}) {
+           CUL_HM_appFromQ($mhp->{devN},"cf");# stack cmds if waiting
+-          if (defined($mhp->{devH}->{helper}{io}{flgs}) && ($mhp->{devH}->{helper}{io}{flgs} & 0x02)) { #noansi: io prepared?
+-            if (!(   $mhp->{devH}->{IODev}->{helper}{VTS_LZYCFG} # for TSCUL VTS0.34 up, wakeup Ack was automatically sent
+-                  || $mhp->{devH}->{IODev}->{TYPE} =~ m/^(?:HMLAN|HMUARTLGW)$/s )
+-                ) {
+-              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'); #noansi: Ack with wakeup bit set for CUL
++          $devHlpr->{prt}{sleeping} = 0;
++        }
++        if ($mhp->{devH}->{cmdStack}) {
++          if ($mhp->{devH}->{helper}{io}{sendWu}) {
++            if ($mhp->{mTp} eq '10') {
++#              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack with wakeup bit set for CUL but the send needs to be delayed by about 5xx ms :(
++              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8002'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack normal for CUL, this allows one step at least. Unfortunately CUL does not repeat autonomously
++            }
++            else {
++              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack with wakeup bit set for CUL
+             }
+-            $devHlpr->{prt}{sleeping} = 0;
+-            CUL_HM_ProcessCmdStack($mhp->{devH});
++            delete($mhp->{devH}->{helper}{aesAuthBytes}); #noansi: ack is sent
+           }
++          CUL_HM_ProcessCmdStack($mhp->{devH});
++          $mhp->{wakupAck} = 1;
++          delete($mhp->{devH}->{helper}{io}{sendWu});
+         }
+         $devHlpr->{prt}{sleeping} = 1 if (!$devHlpr->{prt}{sProc}); # set back to sleeping with next trigger, if nothing to do
+       }
+-      elsif ($rxt & 0x08) { #wakeup device
++      elsif ($rxt & 0x08) { #wakeup device as configured in HMConfig
+         CUL_HM_appFromQ($mhp->{devN},"wu");# stack cmd(s) if waiting
+-        if (defined($mhp->{devH}->{helper}{io}{flgs}) && ($mhp->{devH}->{helper}{io}{flgs} & 0x02)) { #noansi: io prepared?
+-          if (!(   $mhp->{devH}->{IODev}->{helper}{VTS_LZYCFG} # for TSCUL VTS0.34 up does it automatically if configured to lazy config
+-                || $mhp->{devH}->{IODev}->{TYPE} =~ m/^(?:HMLAN|HMUARTLGW)$/s ) #HMLAN and HMUARTLGW does it automatically if configured to lazy config
+-              ) {
+-            CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'); #noansi: Ack with wakeup bit set for CUL
++        if ($mhp->{devH}->{cmdStack}) {
++          if ($mhp->{devH}->{helper}{io}{sendWu}) {
++            if ($mhp->{mTp} eq '10') {
++#              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack with wakeup bit set for CUL but the send needs to be delayed by about 5xx ms :(
++              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8002'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack normal for CUL, this allows one step at least. Unfortunately CUL does not repeat autonomously
++            }
++            else {
++#              CUL_HM_SndCmd($mhp->{devH}, '++A112'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}); #noansi: answer with have data message for CUL
++              CUL_HM_SndCmd($mhp->{devH}, $mhp->{mNo}.'8102'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}.'00'.($mhp->{devH}->{helper}{aesAuthBytes}?$mhp->{devH}->{helper}{aesAuthBytes}:'')); #nonasi: Ack with wakeup bit set for CUL
++            }
++            delete($mhp->{devH}->{helper}{aesAuthBytes}); #noansi: ack is sent
+           }
+           CUL_HM_ProcessCmdStack($mhp->{devH});
++          $mhp->{wakupAck} = 1; # maybe not required with A112 as authbytes need to be sendable
++          delete($mhp->{devH}->{helper}{io}{sendWu});
+         }
+       }
+     }
+     else {                      # &0x22== 0x02 wakeup signal in wakeup device manner
+       if ($rxt & 0x18) { #wakeup device or lazy config device
+         CUL_HM_appFromQ($mhp->{devN},"wu");# stack cmd(s) if waiting
+-        if (defined($mhp->{devH}->{helper}{io}{flgs}) && ($mhp->{devH}->{helper}{io}{flgs} & 0x02)) { #noansi: io prepared?
+-          if (!(   $mhp->{devH}->{IODev}->{helper}{VTS_LZYCFG} # for TSCUL VTS0.34 up does it automatically if configured to lazy config
+-                || $mhp->{devH}->{IODev}->{TYPE} =~ m/^(?:HMLAN|HMUARTLGW)$/s ) #HMLAN and HMUARTLGW does it automatically if configured to lazy config
+-              ) {
+-            CUL_HM_SndCmd($mhp->{devH}, '++A112'.CUL_HM_IoId($mhp->{devH}).$mhp->{src}); #noansi: answer with wakeup received message for CUL
++        if ($mhp->{devH}->{cmdStack}) {
++          my $ioId = CUL_HM_IoId($mhp->{devH});
++          if (   $mhp->{devH}->{helper}{io}{sendWu}
++#              || ($ioId ne $mhp->{dst} && $mhp->{devH}->{IODev}{TYPE} =~ m/^HM(?:LAN|UARTLGW)$/s)) { #noansi: for VD combined with virtual TC
++              || ($ioId ne $mhp->{dst} && $mhp->{devH}->{IODev}{TYPE} eq 'HMUARTLGW')) {
++            CUL_HM_SndCmd($mhp->{devH}, '++A112'.$ioId.$mhp->{src}); #noansi: answer with have data message for CUL
+           }
+           CUL_HM_ProcessCmdStack($mhp->{devH});
++#          $mhp->{wakupAck} = 1; # maybe not required with A112 as authbytes need to be sendable
++          delete($mhp->{devH}->{helper}{io}{sendWu});
+         }
+       }
++      $devHlpr->{prt}{sleeping} = 1 if (   $rxt & 0x10
++                                        && !$devHlpr->{prt}{sProc});
+     }
+   }
+   else {
+     if ($mhp->{mFlgH} & 0x20) { # &0x22== 0x20 no wakeup signal
+-      $devHlpr->{prt}{sleeping} = 1 if (   ($rxt & 0x10) # lazy config device
+-                                        && !$devHlpr->{prt}{sProc} ); # autonomous message from device
++      $devHlpr->{prt}{sleeping} = 1 if (   $rxt & 0x10
++                                        && !$devHlpr->{prt}{sProc}); # autonomous message from device
+     }
+   }
+   
+@@ -3394,7 +3480,18 @@
+       $reply = "NACK";
+     }
+     elsif($mhp->{mStp} eq "01"){ #ACKinfo#################
+-      $success = "yes";
++      if (!($mhp->{mFlgH} & 0x10)) {
++        $success = 'yes';
++      }
++      else { #noansi: not for a keep awake Ack, as device want's to tell us something, so we can't process cmdstack
++        #mark timing on the channel, not the device
++        my $chn = sprintf("%02X",hex(substr($mhp->{p},2,2))&0x3f);
++        my $chnhash = $modules{CUL_HM}{defptr}{$chn?$mhp->{src}.$chn:$mhp->{src}};
++        $chnhash = $mhp->{devH} if(!$chnhash);
++        push @evtEt,[$chnhash,0,"CommandAccepted:$success"];
++#        delete $devHlpr->{prt}{wuReSent} #nonasi: delete or not???
++#                if (!$devHlpr->{prt}{mmcS});
++      }
+       CUL_HM_m_setCh($mhp,substr($mhp->{p},2,2));
+       push @evtEt,[$mhp->{cHash},0,"recentStateType:ack"];
+       if (length($mhp->{p})>9){
+@@ -3524,8 +3621,6 @@
+     $devHlpr->{supp_Pair_Rep} = 1; # noansi: suppress next handling of a repeated pair request (if nothing else arrives in between from device)
+ 
+     my $paired = 0; #internal flag
+-    CUL_HM_infoUpdtDevData($mhp->{devN}, $mhp->{devH},$mhp->{p})
+-                  if (!$modules{CUL_HM}{helper}{hmManualOper});
+     my $ioN = $ioHash->{NAME};
+     # hmPair set in IOdev or  eventually in ccu!
+     my $ioOwn  = InternalVal($ioN,"owner_CCU","");
+@@ -3537,6 +3632,8 @@
+     if ( $hmPair ){# pairing is active
+       my $regser = ReadingsVal($mhp->{devN},"D-serialNr",AttrVal($mhp->{devN},'serialNr',''));
+       if (!$hmPser || $hmPser eq $regser){
++        CUL_HM_infoUpdtDevData($mhp->{devN}, $mhp->{devH}, $mhp->{p}, 1) #noansi: update with reshedule of config request
++                  if (!$modules{CUL_HM}{helper}{hmManualOper});
+ 
+         # pairing requested - shall we?      
+         my $ioId = CUL_HM_h2IoId($ioHash);
+@@ -3554,7 +3651,8 @@
+         delete $mhp->{devH}{READINGS}{".RegL_00."};
+         push @evtEt,[$defs{$ioOwn},1,"hmPair:name:$mhp->{devN} SN:".$regser." model:$attr{$mhp->{devN}}{model}"];
+         if (!$modules{CUL_HM}{helper}{hmManualOper}){
+-          $attr{$mhp->{devN}}{IODev} = $ioN;
++          $mhp->{devH}->{READINGS}{IODev}{VAL} = $ioN;
++          $mhp->{devH}->{READINGS}{IODev}{TIME} = TimeNow();
+           $attr{$mhp->{devN}}{IOgrp} = "$ioOwn:$ioHash->{NAME}" if($ioOwn);
+           CUL_HM_assignIO($mhp->{devH}) ;
+         }
+@@ -3575,10 +3673,33 @@
+         $paired = 1;
+       }
+     }
+-    if($paired == 0 && CUL_HM_getRxType($mhp->{devH}) & 0x14){#no pair -send config?
+-      CUL_HM_appFromQ($mhp->{devN},"cf");   # stack cmds if waiting
+-      my $ioId = CUL_HM_h2IoId($mhp->{devH}{IODev});
+-      $respRemoved = 1;#force command stack processing
++    if (!$paired) {
++      $devHlpr->{supp_Pair_Rep} = 0; #nonasi: was not pairing
++      CUL_HM_infoUpdtDevData($mhp->{devN}, $mhp->{devH}, $mhp->{p}, 0) #noansi: update without reshedule of config request
++                if (!$modules{CUL_HM}{helper}{hmManualOper});
++      my $drxt = CUL_HM_getRxType($mhp->{devH});
++      if (   $drxt & 0x18
++          && !($mhp->{mFlgH} & 0x02)
++          && !$mhp->{devH}->{helper}{io}{supWu}
++          && $mhp->{devH}->{cmdStack}
++          && scalar @{$mhp->{devH}->{cmdStack}}
++          ) {
++        $mhp->{devH}->{helper}{io}{supWu} = 1; #noansi: set suppressing flag for wakeup handling
++        CUL_HM_hmInitMsgUpdt($mhp->{devH});  # remove wakeup prep
++      }
++      if ($drxt & 0x14){#no pair -send config? #noansi: allow config and lazyConfig
++        CUL_HM_appFromQ($mhp->{devN},"cf"); # stack cmds if waiting, for pressing config button to continue in queue on config devices. Waiting for stack empty here does not shedule a pending condig request.
++        if (   $drxt & 0x18
++            && !($mhp->{mFlgH} & 0x02)
++            && !$mhp->{devH}->{helper}{io}{supWu}
++            && $mhp->{devH}->{cmdStack}
++            && scalar @{$mhp->{devH}->{cmdStack}}
++            ) {
++          $mhp->{devH}->{helper}{io}{supWu} = 1; #noansi: set suppressing flag for wakeup handling
++          CUL_HM_hmInitMsgUpdt($mhp->{devH}); # remove wakeup prep
++        }
++        $respRemoved = 1;#force command stack processing
++      }
+     }
+ 
+     $devHlpr->{HM_CMDNR} += 0x27;  # force new setting. Send will take care of module 255
+@@ -3645,23 +3766,21 @@
+                 }
+               }
+             }
+-            CUL_HM_respPendRm($mhp->{devH});
+-            delete $chnhash->{helper}{getCfgList};
+-            delete $chnhash->{helper}{getCfgListNo};
+-            CUL_HM_rmOldRegs($chnName,$readCont);
+-            $chnhash->{READINGS}{".peerListRDate"}{VAL} = $chnhash->{READINGS}{".peerListRDate"}{TIME} = $mhp->{tmStr};
+-            CUL_HM_cfgStateDelay($chnName);#schedule check when finished
+-          }
+-          else{
+-            CUL_HM_respPendToutProlong($mhp->{devH});#wasn't last - reschedule timer
+           }
++          CUL_HM_respPendRm($mhp->{devH});
++          delete $chnhash->{helper}{getCfgList};
++          delete $chnhash->{helper}{getCfgListNo};
++          CUL_HM_rmOldRegs($chnName,$readCont);
++          $chnhash->{READINGS}{".peerListRDate"}{VAL} = $chnhash->{READINGS}{".peerListRDate"}{TIME} = $mhp->{tmStr};
++          CUL_HM_cfgStateDelay($chnName);#schedule check when finished
+         }
+         else{
++          CUL_HM_respPendToutProlong($mhp->{devH});#wasn't last - reschedule timer
+           Log3 $mhp->{devH},4,'waiting for Peerlist: msgNo:'.$rspWait->{mNo}.'+, rec:'.hex($mhp->{mNo});
+         }
+       }
+       else {
+-        Log3 $mhp->{devH},4,'got unexpected PeerList, expected '.$pendType?$pendType:'';
++        Log3 $mhp->{devH},4,'got unexpected PeerList, expected '.$pendType?$pendType.' ':''.'msgNo:'.$rspWait->{mNo}.'+, rec:'.hex($mhp->{mNo});
+       }
+       $ret = "done";
+     }
+@@ -4887,7 +5006,7 @@
+         delete ($hash->{$_}) foreach (grep(/^protErrIo(Id|Attack)/,keys %{$hash}));
+         delete $hash->{READINGS}{$_}
+             foreach (grep /^sabotageAttack/,keys %{$hash->{READINGS}});
+-     }
++      }
+     }
+ 
+   }
+@@ -6123,7 +6242,7 @@
+       CUL_HM_UpdtReadSingle($defs{$teamC},"controlMode","set_".$mode,1);
+       CUL_HM_PushCmdStack($defs{$teamD},'++'.$flag.'11'.$id.$tId.$msg);
+       if (   $tId ne $dst 
+-          && CUL_HM_getRxType($defs{$teamD}) & "02"){
++          && CUL_HM_getRxType($defs{$teamD}) & 0x02){
+         # burst device - we need to send immediately
+         CUL_HM_SndCmd($defs{$teamD},"++B112$id".substr($tId,0,6));
+       }
+@@ -6153,7 +6272,7 @@
+         CUL_HM_PushCmdStack($defs{$teamD},'++'.$flag."11$id$tId"."86$teamCh$temp");
+         CUL_HM_UpdtReadSingle($defs{$teamC},"state",$state,1);
+         if (   $tId ne $dst 
+-            && CUL_HM_getRxType($defs{$teamD}) & "02"){
++            && CUL_HM_getRxType($defs{$teamD}) & 0x02){
+           # burst device - we need to send immediately
+           CUL_HM_SndCmd($defs{$teamD},"++B112$id".substr($tId,0,6));
+         }
+@@ -6900,7 +7019,7 @@
+     my $serial = ReadingsVal($name, "D-serialNr", AttrVal($name,'serialNr',""));
+     return "serial $serial - wrong length or Reading D-serialNr not present"
+           if(length($serial) != 10);
+-    my ($IO,undef)=split(":",AttrVal("laSwitch","IOgrp",AttrVal("laSwitch","IODev","")));
++    my ($IO,undef)=split(":",AttrVal("laSwitch","IOgrp",ReadingsVal("laSwitch","IODev","")));
+     if ($cmd eq "pair"){
+       return "no IO defined - cannot issue command" if (!defined $IO || !defined $defs{$IO} );
+       CUL_HM_Set($defs{$IO},$IO,"hmPairSerial",$serial);
+@@ -7161,12 +7280,13 @@
+       }
+       elsif(  ($vc ne "init" && $hashVd->{msgRed} <= $hashVd->{miss})
+             || $hash->{helper}{virtTC} ne "00") {
+-        $hashVd->{msgSent} = 1;
+         CUL_HM_SndCmd($defs{$hashVd->{nDev}},sprintf("%02X%s%s%s"
+                                              ,$msgCnt
+                                              ,$hashVd->{cmd}
+                                              ,$hash->{helper}{virtTC}
+                                              ,$hashVd->{val}));
++        $hashVd->{msgSent} = 1;
++        $defs{$hashVd->{nDev}}->{helper}{prt}{reSent} = 4; #noansi: no repeat wanted, if no answer
+       }
+       InternalTimer($tn+10,"CUL_HM_valvePosTmr","valveTmr:$vId",0);
+       $hashVd->{virtTC} = $hash->{helper}{virtTC};#save for repeat
+@@ -7230,18 +7350,22 @@
+   InternalTimer(gettimeofday()+150,"CUL_HM_weather","weather:$name",0);
+ }
+ 
+-sub CUL_HM_infoUpdtDevData($$$) {#autoread config
+-  my($name,$hash,$p) = @_;
++sub CUL_HM_infoUpdtDevData($$$$) {#autoread config
++  my($name,$hash,$p,$muf) = @_;
+   my($fw1,$fw2,$mId,$serNo,$stc,$devInfo) = unpack('A1A1A4A20A2A*', $p);
+-  
+-  my $md = $culHmModel->{$mId}{name} ? $culHmModel->{$mId}{name}:"unknown";# original model 
++
++  my $mdold = defined($attr{$name}{model}) ? $attr{$name}{model} : "unknown";
++
++  my $md = AttrVal($name, 'modelForce', $culHmModel->{$mId}{name} ? $culHmModel->{$mId}{name} : "unknown");# original model or forced model
+   my $serial = pack('H*',$serNo);
+   my $fw = sprintf("%d.%d", hex($fw1),hex($fw2));
+   $attr{$name}{".mId"}     = $mId;
+   $attr{$name}{serialNr}   = $serial;  # to be removed from attributes
+   $attr{$name}{firmware}   = $fw;      # to be removed from attributes
+ 
+-  CUL_HM_updtDeviceModel($name,AttrVal($name,"modelForce",$md));#model may be overwritten by modelForce
++  CUL_HM_updtDeviceModel($name, $md) if (   $muf           #noansi: forced by pairing
++                                         || $mdold ne $md);#model may be overwritten by modelForce
++                                                           #noansi: avoid reshedule of config update for config devices in CUL_HM_updateConfig as often as possible
+   CUL_HM_complConfigTest($name) if(ReadingsVal($name,"D-firmware","") ne $fw     # force read register
+                                  ||ReadingsVal($name,"D-serialNr","") ne $serial
+                                  ||ReadingsVal($name,".D-devInfo","") ne $devInfo
+@@ -7681,10 +7805,10 @@
+     elsif($mTp eq '11')                {
+       my $to = "";
+       if ($chn eq "02"){#!!! chn is subtype!!!
+-        if ($dat =~ m/(..)....(....)/){#lvl ne 0 and timer on
++        if ($dat =~ m/^(..)....(....)/){#lvl ne 0 and timer on
+           # store Channel in this datafield. 
+           # dimmer may answer with wrong virtual channel - then dont resent!
+-          $hash->{helper}{tmdOn} = $sTp if ($1 ne "00" && $2 !~ m/(0000|FFFF)/);
++          $hash->{helper}{tmdOn} = $sTp if ($1 ne "00" && $2 !~ m/^(0000|FFFF)/);
+           $to = "timedOn:=1";
+         }
+       }
+@@ -7966,10 +8090,11 @@
+     elsif ($pHash->{try}){         #send try failed - revert, wait for wakeup
+       # device might still be busy with writing flash or similar
+       # we have to wait for next wakeup
+-      unshift (@{$hash->{cmdStack}}, "++".substr($pHash->{rspWait}{cmd},6));
++      unshift (@{$hash->{cmdStack}}, "++".substr($pHash->{rspWait}{cmd},6))
++          if (substr($pHash->{rspWait}{cmd},8,2) ne "58"); #noansi: do not repeat TC duty cycle
+       delete $pHash->{try};
+       CUL_HM_respPendRm($hash);# do not count problems with wakeup try, just wait
+-      CUL_HM_protState($hash,"CMDs_pending");
++      CUL_HM_protState($hash,"CMDs_pending",1); #noansi: with wakeup prep
+     }
+     elsif (!CUL_HM_operIObyIOHash($hash->{IODev})){#IO errors
+       CUL_HM_eventP($hash,"IOdly");
+@@ -8011,7 +8136,7 @@
+         }
+         my $wuReSent = $pHash->{rspWait}{reSent};# save 'invalid' count
+         CUL_HM_respPendRm($hash);#clear
+-        CUL_HM_protState($hash,"CMDs_pending");
++        CUL_HM_protState($hash,"CMDs_pending",1); #noansi: with wakeup prep
+         $pHash->{wuReSent} = $wuReSent;# restore'invalid' count after general delete
+       }
+       else{# normal/burst device resend
+@@ -8212,8 +8337,8 @@
+     CUL_HM_respPendRm($hash);
+   }
+ }
+-sub CUL_HM_protState($$){
+-  my ($hash,$state) = @_;
++sub CUL_HM_protState($$;$){
++  my ($hash,$state,$wakeupPrep) = @_;
+   my $name = $hash->{NAME};
+ 
+   my $sProcIn = $hash->{helper}{prt}{sProc};
+@@ -8231,11 +8356,17 @@
+                             :"");
+     delete($hash->{cmdStack});
+     delete($hash->{protCmdPend});
++    delete($hash->{helper}{io}{supWu});
+     $hash->{helper}{prt}{bErr}  = 0;
+     $hash->{helper}{prt}{sProc} = 0;
+     $hash->{helper}{prt}{awake} = 0 if (defined $hash->{helper}{prt}{awake});
++    $wakeupPrep = (   $wakeupPrep
++                   || (   (   $hash->{helper}{q}{qReqConf}
++                           || $hash->{helper}{q}{qReqStat} )
++                       && CUL_HM_getRxType($hash) & 0x18 ) ); #wakeup prep for wakeup, lazyConfig 
+   }
+   elsif($state eq "Info_Cleared"){
++    delete($hash->{helper}{io}{supWu});
+     $hash->{helper}{prt}{sProc} = 0;
+     $hash->{helper}{prt}{awake} = 0 if (defined $hash->{helper}{prt}{awake});
+   }
+@@ -8249,6 +8380,7 @@
+   }
+   $hash->{protState} = $state;
+   
++#  CUL_HM_UpdtReadSingle($hash,"commState",$state,1);
+   CUL_HM_UpdtReadSingle($defs{$_},"commState",$state,1) foreach(CUL_HM_getAssChnNames($name));#trigger for all channels required due to bad hierarchical structure of FHEM
+   if (!$hash->{helper}{role}{chn}){
+     CUL_HM_UpdtReadSingle($hash,"state",$state,
+@@ -8256,9 +8388,10 @@
+   }
+   Log3 $name,5,"CUL_HM $name protEvent:$state".
+             ($hash->{cmdStack}?" pending:".scalar @{$hash->{cmdStack}}:"");
+-  CUL_HM_hmInitMsgUpdt($hash) if (  $hash->{helper}{prt}{sProc} != $sProcIn
+-                                  && (   $hash->{helper}{prt}{sProc} < 2
+-                                      ||($hash->{helper}{prt}{sProc} == 2 && $sProcIn == 0 )));
++  CUL_HM_hmInitMsgUpdt($hash, $wakeupPrep) if (  $hash->{helper}{prt}{sProc} != $sProcIn
++                                               && (   $wakeupPrep
++                                                   || $hash->{helper}{prt}{sProc} < 2
++                                                   ||($hash->{helper}{prt}{sProc} == 2 && $sProcIn == 0 )));
+ }
+ 
+ ###################-----------helper and shortcuts--------#####################
+@@ -9077,19 +9210,30 @@
+   my $name = shift;
+   $name = CUL_HM_getDeviceName($name);
+ #  stacktrace();
+-  RemoveInternalTimer("cfgStateUpdate:$name");
+-  if (InternalVal($name,"protCmdPend","none"   ) eq "none"){
+-    CUL_HM_cfgStateUpdate("cfgStateUpdate:$name");
+-  }
+-  else{
+-    InternalTimer(gettimeofday()+ 60,"CUL_HM_cfgStateUpdate","cfgStateUpdate:$name", 0);     
+-  }
++  $defs{$name}->{'.cfgStateUpdateTmr'}++; #noansi: the last update (timer) try counts
++  CUL_HM_cfgStateUpdate('cfgStateUpdate:'.$name);
++  return;
+ }
+ sub CUL_HM_cfgStateUpdate($) {#update cfgState
+   my $tmrId = shift;
+-  my (undef,$name) = split(':',$tmrId,2);
+-  my ($hm) = devspec2array("TYPE=HMinfo");
+-  HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($name),$name)).")\$") if(defined $hm);  
++  my (undef,$name) = split(/:/,$tmrId,2);
++  my $dhash = $defs{$name};
++  return if (!defined($dhash));
++  $dhash->{'.cfgStateUpdateTmr'}--;
++  if (   !$evtDly                      #noansi: first Readings must be set, helps also not to disturb others
++      && !$dhash->{helper}{prt}{sProc} #not busy with commands?
++      ){
++    return if ($dhash->{'.cfgStateUpdateTmr'} > 0); #noansi: the last update (timer) try counts
++    delete($dhash->{'.cfgStateUpdateTmr'});
++    my ($hm) = devspec2array('TYPE=HMinfo');
++    HMinfo_GetFn($defs{$hm},$hm,'configCheck','-f','^('.join('|',(CUL_HM_getAssChnNames($name),$name)).')$')
++      if (defined($hm));
++  }
++  else{
++    $dhash->{'.cfgStateUpdateTmr'}++; #noansi: the last update (timer) try counts
++    InternalTimer(gettimeofday() + 60, \&CUL_HM_cfgStateUpdate, $tmrId, 0); # try later
++  }
++  return;
+ }
+ 
+ sub CUL_HM_rmOldRegs($$){ # remove register i outdated
+@@ -10281,8 +10425,10 @@
+ 
+   $defs{$name}{assignedIOs} = join(",",devspec2array("hmId=$id"));
+   
+-  foreach my $ioN(split",",AttrVal($name,"IOList","")){# set parameter in IO
+-    next if (!$defs{$ioN});
++  my $iol = AttrVal($name,'IOList','');
++  my @ioList = grep /.+/,map{$defs{$_} ? $_ : ''} split(/,/,$iol); 
++  $defs{$name}{helper}{io}{ioList} = \@ioList;
++  foreach my $ioN (@ioList){# set parameter in IO
+     my $t = $defs{$ioN}{TYPE};
+     if (   $t =~ m/^(HMLAN|HMUARTLGW)$/){
+       ; # nothing special to do on device
+@@ -10315,16 +10461,15 @@
+     }
+   }
+ 
+-  my @ioList = grep /.+/,map{$defs{$_} ? $_ : ""} split(",",AttrVal($name,"IOList","")); 
+-  $defs{$name}{helper}{io}{ioList} = \@ioList;
+-  my $io = AttrVal($name,"IODev","empty");# assign IODev to vccu
+-  if (AttrVal($name,"IOList","") !~ m/$io/){
+-    foreach(@ioList){
+-      if ($defs{$_}){
+-        $attr{$name}{IODev} = $_;
+-        last;
+-      }
+-    }
++  $defs{$name}{helper}{io}{vccu} = $name
++     if (   !$defs{$name}{helper}{io}{vccu}
++         && $iol); # noansi: help, if IOgrp is missing for VCCU
++
++  my $io = ReadingsVal($name,'IODev','empty');# assign IODev to vccu
++  if ($iol !~ m/$io/ && int(@ioList)){
++    $defs{$name}{IODev} = $defs{$ioList[0]};
++    $defs{$name}{READINGS}{IODev}{VAL} = $ioList[0];
++    $attr{$name}{IODev} = $ioList[0];
+   }
+   my $logOpt = 
+                 "logIDs:multiple,none,sys,all,broadcast,"
+@@ -10388,7 +10533,9 @@
+   # assign IO device
+   my $hash = shift;
+   my $result = 0; # default: IO unchanged
+-  my $oldIODevH = CUL_HM_operIObyIOHash($hash->{IODev});
++  my $oldIODevH = $modules{CUL_HM}{helper}{initDone} ?
++                     CUL_HM_operIObyIOHash($hash->{IODev})
++                   : undef; #noansi: during FHEM init device is not correctly assigned to IO, force a set
+   my $hh = $hash->{helper};
+ 
+   return $result
+@@ -10416,7 +10563,7 @@
+     unshift @ios,@{$hh->{io}{prefIO}} if ($hh->{io}{prefIO});# set prefIO to first choice
+     if ($hh->{io}{restoredIO}) { # set restoredIO to very first choice
+       unshift @ios,$hh->{io}{restoredIO};
+-      delete ($hh->{io}{restoredIO}) if ($init_done); # we have a user choice, delete restore data
++      delete ($hh->{io}{restoredIO}) if ($modules{CUL_HM}{helper}{initDone}); # we have a user choice, delete restore data
+       Log3 $hash->{NAME}, 0, "CUL_HM_assignIO ".$hash->{NAME}." autoassign restoredIO used";
+     }
+     foreach my $iom (@ios){
+@@ -10427,27 +10574,17 @@
+   }
+ 
+   if (!defined $newIODevH) {# not assigned thru CCU - try normal
+-    $newIODevH = $oldIODevH; # try keep the last one, if defined and operational
+-    my $dIo = AttrVal($hash->{NAME},"IODev",""); # if no VCCU is used, attr IODev is the first choice. But if VCCU is used, attr IODev must not be used for restore to work! Then it should be removed from attributes!
++    # not assigned thru CCU - try normal
++    my $dIo = ReadingsVal($hash->{NAME},'IODev',$hh->{io}{restoredIO}); # if no VCCU is used, reading/attr IODev is the first choice. But if VCCU is used, reading/attr IODev must not be used for restore to work! Then it should be removed from attributes! fhem.pl put attr IODev in reading IODev
+     if (CUL_HM_operIObyIOName($dIo)) {
+-      if (   !defined($oldIODevH)
+-          || ($oldIODevH->{NAME} ne $dIo) ) {
+-        $newIODevH = $defs{$dIo}; # assign according to Attribut
+-        delete ($hh->{io}{restoredIO}) if ($init_done); # we have a user choice, delete restore data
+-        Log3 $hash->{NAME}, 5, "CUL_HM_assignIO ".$hash->{NAME}." attr IODev used";
+-      }
+-    }
+-    else {
+-      if ($hh->{io}{restoredIO}) {
+-        $newIODevH = $defs{$hh->{io}{restoredIO}};
+-        delete ($hh->{io}{restoredIO}) if ($init_done); # delete restore data
+-        Log3 $hash->{NAME}, 0, "CUL_HM_assignIO ".$hash->{NAME}." restoredIO used";
+-      }
+-      else {
+-        AssignIoPort($hash); #let kernal decide, but it is quite time consuming! Only to be used as very last chance!
+-        $newIODevH = CUL_HM_operIObyIOHash($hash->{IODev});
+-        Log3 $hash->{NAME}, 5, "CUL_HM_assignIO ".$hash->{NAME}." AssignIoPort used";
+-      }
++      $newIODevH = $defs{$dIo}; # assign according to reading/attribut
++      delete ($hh->{io}{restoredIO}) if ($modules{CUL_HM}{helper}{initDone}); # we have a user choice, delete restore data
++      Log3 $hash->{NAME}, 5, "CUL_HM_assignIO ".$hash->{NAME}." reading/attr IODev used";
++    }
++    elsif (!defined($newIODevH)) {
++      AssignIoPort($hash); #let kernel decide, but it is quite time consuming! Only to be used as very last chance!
++      $newIODevH = CUL_HM_operIObyIOHash($hash->{IODev});
++      Log3 $hash->{NAME}, 5, "CUL_HM_assignIO ".$hash->{NAME}." AssignIoPort used";
+     }
+   }
+ 
+@@ -10465,11 +10602,12 @@
+                  || ($lIODevH == $newIODevH) );
+         if (ReadingsVal($ioLd,"state","") ne "disconnected") {
+           if (   $lIODevH->{helper}{VTS_AES} #if this unselected IO is TSCUL 0.14+ we have to remove the device from IO, as it starts with "historical" assignment data
+-              || (   defined($lastIODevH)
+-                  && ($lIODevH == $lastIODevH) # HMLAN/HMUARTLGW always start with clean peerlist? At least it tries to.
+-                  && $lIODevH->{TYPE}
+-                  && $lIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/s
+-                  ) #if this unselected IO is HMLAN we have to remove the device from IO
++#              || (   defined($lastIODevH)
++#                  && ($lIODevH == $lastIODevH) # HMLAN/HMUARTLGW always start with clean peerlist? At least it tries to.
++#                  && $lIODevH->{TYPE}
++#                  && $lIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/s
++#                  ) #if this unselected IO is HMLAN we have to remove the device from IO
++              || $lIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/s  #if this unselected IO is HMLAN we have to remove the device from IO
+               ) {
+             $hash->{IODev} = $lIODevH; # temporary assignment for IOWrite to work on each IO!
+             IOWrite($hash, "", "remove:".$ID);
+@@ -10479,16 +10617,56 @@
+     }
+ 
+     $hash->{IODev} = $newIODevH; # finally assign IO
+-    $attr{$hash->{NAME}}{IODev} = $newIODevH->{NAME}
+-      if (AttrVal($hash->{NAME}, 'model', '') !~ m/^(?:VIRTUAL|CCU-FHEM)$/s);
++    $hash->{READINGS}{IODev}{VAL} = $newIODevH->{NAME}; #noansi: set the IODev reading, it will survive a normal restart, but an existing IODev attribute will overwrite it
++    if (   $haveIOList
++        && defined($attr{$hash->{NAME}}{IODev}) #noansi: keep it synced, if it is defined
++        && AttrVal($hash->{NAME}, 'model', '') !~ m/^(?:VIRTUAL|CCU-FHEM)$/s) {
++#      delete($attr{$hash->{NAME}}{IODev}) if ($newIODevH->{helper}{VTS_AES}); #noansi: for TSCUL it would be better to delete, but let the user do it, philosophy of fhem.pl
++      $attr{$hash->{NAME}}{IODev} = $newIODevH->{NAME}; #noansi: keep it synced, if it is defined
++    }
+     
+     if (   ($newIODevH->{TYPE} && $newIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/)
+         || (   $newIODevH->{helper}{VTS_AES})){
+       IOWrite($hash, "", "init:".$ID); # assign to new IO
+     }
+-   $result = 1; # IO changed
+-   }
+- return $result;
++    else {
++      if (   defined($hash->{helper}{io}{flgs})
++          && $hash->{helper}{io}{flgs} & 0x02) { $hash->{helper}{io}{sendWu} = 1;     } #noansi: for CUL
++      else                                     { delete($hash->{helper}{io}{sendWu}); }
++    }
++    $result = 1; # IO changed
++  }
++  return $result;
++}
++sub CUL_HM_syncIOassign($){ #remove assignment from all unassigned IOs
++  my $hash = shift;
++  my $hh = $hash->{helper};
++
++  my $ioVCCU  = $hash->{helper}{io}{vccu};
++  if (   $ioVCCU
++      && defined($defs{$ioVCCU})
++      && ref($defs{$ioVCCU}{helper}{io}{ioList}) eq 'ARRAY' ) {
++    my $ID = CUL_HM_hash2Id($hash);
++    my $currioH = $hash->{IODev};
++    my $lIODevH;
++    for my $ioLd (@{$defs{$ioVCCU}{helper}{io}{ioList}}) { # noansi: remove on all unassigned IOs to ensure a consistant state of assignments in IO devices!
++                                                           #         IO has to keep track about and really remove just if required
++      $lIODevH = $defs{$ioLd};
++      next if (   !defined($lIODevH)
++               || ($lIODevH == $currioH) );
++      if (ReadingsVal($ioLd,'state','') ne 'disconnected') {
++        if (   $lIODevH->{TYPE} =~ m/^HM(?:LAN|UARTLGW)$/s #if this unselected IO is HMLAN/HMUARTLGW we have to remove the device from IO
++#            || $lIODevH->{helper}{VTS_AES} #if this unselected IO is TSCUL 0.14+ we have to remove the device from IO, as it starts with "historical" assignment data
++            ) {
++          $hash->{IODev} = $lIODevH; # temporary assignment for IOWrite to work on each IO!
++          IOWrite($hash, '', 'remove:'.$ID);
++        }
++      }
++    }
++    $hash->{IODev} = $currioH; # set IO again
++  }
++
++  return;
+ }
+ 
+ sub CUL_HM_stateUpdatDly($$){#delayed queue of status-request
+@@ -10540,12 +10718,17 @@
+     @chns = grep !/00/,@chns;#remove device as well - just in case
+     $dq->{$q} = join",",@chns;
+   }
+-  my $cq = (CUL_HM_getRxType($defs{$name}) & 0x1C)?($q."Wu") : $q;
+-  return if(  !$modules{CUL_HM}{helper}{$cq} 
+-            || scalar(@{$modules{CUL_HM}{helper}{$cq}}) == 0);
+-  my $mQ = $modules{CUL_HM}{helper}{$cq};
+-  return if(!$mQ || scalar(@{$mQ}) == 0);
+-  @{$mQ} = grep !/^$devN$/,@{$mQ} if ($dq->{$q} eq "");
++  if ($dq->{$q} eq '') {
++    my $rxt = CUL_HM_getRxType($defs{$name});
++    my $mQ = $modules{CUL_HM}{helper}{($rxt & 0x1C) ? $q.'Wu' : $q};
++    return if(!defined($mQ) || scalar(@{$mQ}) == 0);
++    @{$mQ} = grep !/^$devN$/,@{$mQ};
++    if (   $rxt & 0x18 #wakeup, lazyConfig
++        && !$defs{$name}->{helper}{prt}{sProc} #not busy with queue
++        ) {
++      CUL_HM_hmInitMsgUpdt($defs{$devN}); #remove wakeup prep
++    }
++  }
+ }
+ sub CUL_HM_qEntity($$){  # add to queue
+   my ($name,$q) = @_;
+@@ -10562,17 +10745,24 @@
+                                       $defs{$devN}{helper}{q}{$q}
+                                       .",".substr(CUL_HM_name2Id($name),6,2));
+   }
+-  $q .= "Wu" if (CUL_HM_getRxType($defs{$name}) & 0x1C);#normal or wakeup q?
+-  my $qa = $modules{CUL_HM}{helper}{$q};
+-  @{$qa} = CUL_HM_noDup(@{$qa},$devN); #we only q device - channels are stored in the device
+-  my $wT = (@{$modules{CUL_HM}{helper}{qReqStat}})?
+-                              "1":
+-                              $modules{CUL_HM}{hmAutoReadScan};
++  my $rxt = CUL_HM_getRxType($defs{$name});
++  my $wu = ($rxt & 0x1C) ? 'Wu' : ''; #normal or wakeup q?
++  $q .= $wu;
++  my $mQ = $modules{CUL_HM}{helper}{$q};
++  @{$mQ} = CUL_HM_noDup(@{$mQ},$devN); #we only q device - channels are stored in the device
+ 
+   CUL_HM_cfgStateDelay($devN)  if($q eq "qReqConf");
+ 
+-  RemoveInternalTimer("CUL_HM_procQs");
+-  InternalTimer(gettimeofday()+ $wT,"CUL_HM_procQs","CUL_HM_procQs", 0);
++  if (!$wu) {
++    my $wT = (@{$modules{CUL_HM}{helper}{qReqStat}})?
++                                1 :
++                                $modules{CUL_HM}{hmAutoReadScan};
++    RemoveInternalTimer("CUL_HM_procQs");
++    InternalTimer(gettimeofday()+ $wT,"CUL_HM_procQs","CUL_HM_procQs", 0);
++  }
++  else {
++    CUL_HM_hmInitMsgUpdt($defs{$devN}, 1) if ($rxt & 0x18); #wakeup prep for wakeup, lazyConfig 
++  }
+ }
+ 
+ sub CUL_HM_readStateTo($){#staterequest not working
