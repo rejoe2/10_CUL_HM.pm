@@ -233,6 +233,7 @@ sub CUL_HM_updateConfig($){##########################
     my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
     
     for (@hmdev){
+      #$defs{$_}->{helper}{io}{restoredIO} = ReadingsVal($_,'IODev',undef) if ReadingsVal($_,'IODev',undef); #Beta-User: try to keep startup info somewhere
       if ( defined $attr{$_}{IODev} ) {
           if ( AttrVal($?,'IOgrp','') ne '' ) {
             delete $attr{$_}{IODev} ; #Beta-User: might fix https://forum.fhem.de/index.php/topic,123257.msg1178337.html#msg1178337
@@ -240,7 +241,7 @@ sub CUL_HM_updateConfig($){##########################
               $defs{$_}->{helper}{io}{restoredIO} = AttrVal($_,'IODev','none'); #Beta-User: noansi idea from 24374
           }
       }
-      delete $attr{$_}{IOList} if (AttrVal($_,'model','') ne 'CCU-FHEM'); #Beta-User: adopted from noansi https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983
+      delete $attr{$_}{IOList} if AttrVal($_,'model','') ne 'CCU-FHEM'; #Beta-User: adopted from noansi https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983
       CUL_HM_Attr('set',$_,'IOList',AttrVal($_,'IOList','')) if AttrVal($_,'IOList',undef); #Beta-User: Fix missing io->ioList in VCCU at startup, https://forum.fhem.de/index.php/topic,122848.msg1174047.html#msg1174047
       #Beta-User: might have to be executed again after startup?
     }
@@ -1662,7 +1663,7 @@ sub CUL_HM_Notify(@){###############################
       return "CUL_HM: $count device(s) renamed or attributes changed due to DELETED or RENAMED event" if $count;
       return;
     }
-    elsif (!$modules{CUL_HM}{helper}{initDone} && $evnt =~ m/INITIALIZED|REREADCFG/){# grep the first initialize
+    elsif (!$modules{CUL_HM}{helper}{initDone} && $evnt =~ m/INITIALIZED/){# grep the first initialize
       #Beta-User: Perform HMinfo configCheck if possible, first for real Devices, then for VIRTUALs
       #Log3(undef,3,"debug: CUL_HM event $evnt");
       CUL_HM_updateConfig("startUp");
@@ -1789,8 +1790,9 @@ sub CUL_HM_Parse($$) {#########################################################
     $mh{devH} = CUL_HM_id2Hash($mh{src}); #sourcehash - changed to channel entity
     $mh{devH}->{IODev} = $iohash;
     if (!$modules{CUL_HM}{helper}{hmManualOper}){
-      $mh{devH}->{READINGS}{IODev}{VAL} = $mh{ioName}; #Beta-User: noansi 24374
-      $mh{devH}->{READINGS}{IODev}{TIME} = TimeNow(); #dto
+      readingsSingleUpdate($mh{devH},'IODev',$mh{ioName},0,TimeNow()); #Beta-User: see next lines
+      #$mh{devH}->{READINGS}{IODev}{VAL} = $mh{ioName}; #Beta-User: noansi 24374
+      #$mh{devH}->{READINGS}{IODev}{TIME} = TimeNow(); #dto
       my $ioOwn = InternalVal($mh{ioName},'owner_CCU','');
       $defs{$sname}{IODev} = $defs{$mh{ioName}}; 
       if ($ioOwn) {
@@ -1806,7 +1808,8 @@ sub CUL_HM_Parse($$) {#########################################################
         }
       }
       else{
-        $attr{$sname}{IODev} = $mh{ioName}; 
+        #$attr{$sname}{IODev} = $mh{ioName}; #Beta-User: why write Attr?
+        $attr{$sname}{IODev} = $mh{ioName} if defined $attr{$sname}{IODev}; #Beta-User: really want to do that silently and not via CUL_HM_Attr?
       }
     }
     $mh{devH}->{helper}{io}{nextSend} = $mh{rectm}+0.09 if(!defined($mh{devH}->{helper}{io}{nextSend}));# io couldn't set
