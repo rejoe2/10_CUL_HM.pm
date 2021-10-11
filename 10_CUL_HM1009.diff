@@ -1,0 +1,898 @@
+--- 10_CUL_HM.pm	2021-10-10 09:50:22.000000000 +0200
++++ 10_CUL_HM.pm.1009	2021-10-10 19:27:26.621779623 +0200
+@@ -1,7 +1,7 @@
+ ##############################################
+ ##############################################
+ # CUL HomeMatic handler
+-# $Id: 10_CUL_HM.pm 25059 2021-10-10 07:50:22Z martinp876 $
++# $Id: 10_CUL_HM.pm 24961 2021-10-07 + various Beta-User+frank-Patches + sort II + new initialisation + allow more set commands in startup phase + start before HMinfo  $
+ 
+ package main;
+ 
+@@ -85,7 +85,7 @@
+ sub CUL_HM_SndCmd($$);
+ sub CUL_HM_responseSetup($$);
+ sub CUL_HM_eventP($$);
+-sub CUL_HM_protState($$);
++sub CUL_HM_protState($$;$);
+ sub CUL_HM_respPendRm($);
+ sub CUL_HM_respPendTout($);
+ sub CUL_HM_respPendToutProlong($);
+@@ -232,6 +232,19 @@
+     $mIdReverse = 1 if (scalar keys %{$culHmModel2Id});
+     my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
+     
++    for (@hmdev){
++      if ( defined $attr{$_}{IODev} ) {
++          if ( AttrVal($?,'IOgrp','') ne '' ) {
++            delete $attr{$_}{IODev} ; #Beta-User: might fix https://forum.fhem.de/index.php/topic,123257.msg1178337.html#msg1178337
++          } else {
++              $defs{$_}->{helper}{io}{restoredIO} = AttrVal($_,'IODev','none'); #Beta-User: noansi idea from 24374
++          }
++      }
++      delete $attr{$_}{IOList} if (AttrVal($_,'model','') ne 'CCU-FHEM'); #Beta-User: adopted from noansi https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983
++      CUL_HM_Attr('set',$_,'IOList',AttrVal($_,'IOList','')) if AttrVal($_,'IOList',undef); #Beta-User: Fix missing io->ioList in VCCU at startup, https://forum.fhem.de/index.php/topic,122848.msg1174047.html#msg1174047
++      #Beta-User: might have to be executed again after startup?
++    }
++    
+     foreach my $name  (@hmdev){
+       if ($attr{$name}{subType} && $attr{$name}{subType} eq "virtual"){
+         $attr{$name}{model} = "VIRTUAL" if (!$attr{$name}{model} || $attr{$name}{model} =~ m/virtual_/);
+@@ -246,13 +259,9 @@
+       }
+       CUL_HM_updtDeviceModel($name,AttrVal($name,"modelForce",AttrVal($name,"model","")),1) if($attr{$name}{".mId"});
+       # update IOdev
+-      my $IOgrp = AttrVal($name,"IOgrp","");
+-      if($IOgrp ne ""){
+-        delete $attr{$name}{IODev};
+-        CUL_HM_Attr("set",$name,"IOgrp",$IOgrp);
+-        CUL_HM_Attr('set',$name,'IOList',AttrVal($name,'IOList','')) if AttrVal($name,'IOList',undef); #Beta-User: Fix missing io->ioList in VCCU at startup, https://forum.fhem.de/index.php/topic,122848.msg1174047.html#msg1174047
+-      }
++      CUL_HM_Attr("set",$name,"IOgrp",AttrVal($name,"IOgrp","")) if(AttrVal($name,"IOgrp","") ne "");# update helper by set attr again #Beta-User: might be to early in first notify loop?
+       my $h = $defs{$name};
++      $h->{helper}{prt}{sleeping} = 1 if (CUL_HM_getRxType($h) & 0x10); #Beta-User: noansi https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983
+       delete $h->{helper}{io}{restoredIO} if (   defined($h->{helper}{io})
+                                               && defined($h->{helper}{io}{restoredIO})
+                                               && !defined($defs{$h->{helper}{io}{restoredIO}})); # cleanup undefined restored IO
+@@ -416,16 +425,20 @@
+     }
+     elsif ($st eq "virtual" ) {#setup virtuals
+       $hash->{helper}{role}{vrt} = 1;
++      #if (AttrVal($name,'peerIDs',undef) && !keys %{$defs{$name}{helper}{peerIDsH}}) {
++      #  CUL_HM_ID2PeerList($name,$_,1) for ('peerUnread',split q{,},AttrVal($name,'peerIDs',''));
++      #} #Beta-User: Might not have been called earlier. Then subtype is unknown yet, https://forum.fhem.de/index.php/topic,123136.msg1177303.html#msg1177303;
+       if (   $hash->{helper}{fkt} 
+           && $hash->{helper}{fkt} =~ m/^(vdCtrl|virtThSens)$/){
+         my $vId = substr($id."01",0,8);
+         if (!defined $hash->{helper}{vd}{msgRed}) {
+-          $hash->{helper}{vd}{msgRed}= 0;
+-          my $attrVal = AttrVal($name,'param','');
+-          if ($attrVal =~ m/msgReduce/) {
+-            my (undef,$rCnt) = split(":",$attrVal,2);
+-            $hash->{helper}{vd}{msgRed} = (defined $rCnt && $rCnt =~ m/^\d$/) ? $rCnt : 1;
+-          }
++            $hash->{helper}{vd}{msgRed}=0;
++            my $attrVal = AttrVal($name,'param','');
++            if ($attrVal =~ m/msgReduce/) {
++                my (undef,$rCnt) = split(":",$attrVal,2);
++                $rCnt=(defined $rCnt && $rCnt =~ m/^\d$/)?$rCnt:1;
++                $hash->{helper}{vd}{msgRed}=$rCnt;
++            }
+         }
+         if(!defined $hash->{helper}{vd}{next}){
+           ($hash->{helper}{vd}{msgCnt},$hash->{helper}{vd}{next}) = 
+@@ -434,6 +447,24 @@
+           $hash->{helper}{vd}{idh} = 0;
+         }
+         InternalTimer(time+10,'CUL_HM_initializeVirtuals', $hash,0); #Beta-User: make sure, CUL_HM is in toto up and running befor other devices want to use them, 
++=pod
++        if ($hash->{helper}{fkt} eq "vdCtrl"){
++          my $d = ReadingsNum($name,'valvePosTC','50');
++                   Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++          CUL_HM_Set($hash,$name,"valvePos",$d);
++          CUL_HM_UpdtReadSingle($hash,"valveCtrl","restart",1) if ($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++          RemoveInternalTimer("valvePos:$vId");
++          RemoveInternalTimer("valveTmr:$vId");
++          InternalTimer($hash->{helper}{vd}{next},"CUL_HM_valvePosUpdt","valvePos:$vId",0);
++        }
++        elsif($hash->{helper}{fkt} eq "virtThSens"){
++                   Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++          my $d = ReadingsNum($name,'temperature','20');
++          CUL_HM_Set($hash,$name,"virtTemp",$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++          $d = ReadingsVal($name,"humidity","");
++          CUL_HM_Set($hash,$name,"virtHum" ,$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++        }
++=cut
+ 
+         # delete - virtuals dont have regs 
+         delete $attr{$name}{$_} foreach ("autoReadReg","actCycle","actStatus","burstAccess","serialNr"); 
+@@ -520,11 +551,10 @@
+     }
+     $attr{$name}{webCmd} = $webCmd if ($webCmd);
+ 
+-    CUL_HM_SetList($name,"") if (!defined $defs{$name}{helper}{cmds}{cmdLst});
+     #remove invalid attributes. After set commands fot templist
+     CUL_HM_Attr("set",$name,"peerIDs",$attr{$name}{peerIDs}) if (defined $attr{$name}{peerIDs});# set attr again to update namings
+     foreach(sort keys %{$attr{$name}}){
+-      delete $attr{$name}{$_} if (CUL_HM_AttrCheck($name,'set',$_,$attr{$name}{$_}));  
++      delete $attr{$name}{$_} if (CUL_HM_AttrCheck($name,'set',$_,$attr{$name}{$_}));  #Beta-User: fixes missing tempListTmpl, see also noansi => https://forum.fhem.de/index.php/topic,122107.msg1166930.html#msg1166930
+     }
+     CUL_HM_qStateUpdatIfEnab($name) if($hash->{helper}{role}{dev});
+     next if (0 == (0x07 & CUL_HM_getAttrInt($name,"autoReadReg")));
+@@ -556,20 +586,20 @@
+     my $name = $hash->{NAME} // return;
+     my $vId = substr($hash->{DEF}."01",0,8);
+     if ($hash->{helper}{fkt} eq "vdCtrl"){
+-      my $d = ReadingsNum($name,'valvePosTC','50');
+-                 #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
+-      CUL_HM_Set($hash,$name,"valvePos",$d);
+-      CUL_HM_UpdtReadSingle($hash,"valveCtrl","restart",1) if ($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+-      RemoveInternalTimer("valvePos:$vId");
+-      RemoveInternalTimer("valveTmr:$vId");
+-      InternalTimer($hash->{helper}{vd}{next},"CUL_HM_valvePosUpdt","valvePos:$vId",0);
++        my $d = ReadingsNum($name,'valvePosTC','50');
++                   #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++        CUL_HM_Set($hash,$name,"valvePos",$d);
++        CUL_HM_UpdtReadSingle($hash,"valveCtrl","restart",1) if ($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++        RemoveInternalTimer("valvePos:$vId");
++        RemoveInternalTimer("valveTmr:$vId");
++        InternalTimer($hash->{helper}{vd}{next},"CUL_HM_valvePosUpdt","valvePos:$vId",0);
+     }
+     elsif($hash->{helper}{fkt} eq "virtThSens"){
+-             #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
+-      my $d = ReadingsNum($name,'temperature','');
+-      CUL_HM_Set($hash,$name,"virtTemp",$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+-      $d = ReadingsNum($name,"humidity","");
+-      CUL_HM_Set($hash,$name,"virtHum" ,$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++               #Log(1,"----- test2 ----- -> n:$name"); #Beta-User: For Debugging only
++        my $d = ReadingsNum($name,'temperature','');
++        CUL_HM_Set($hash,$name,"virtTemp",$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
++        $d = ReadingsNum($name,"humidity","");
++        CUL_HM_Set($hash,$name,"virtHum" ,$d) if($d =~ m/^[-+]?[0-9]+\.?[0-9]*$/);
+     }
+     return;
+ }
+@@ -591,6 +621,7 @@
+     }
+   }
+ }
++
+ sub CUL_HM_Define($$) {##############################
+   my ($hash, $def) = @_;
+   my @a = split("[ \t][ \t]*", $def);
+@@ -646,8 +677,8 @@
+     $hash->{helper}{HM_CMDNR}    = int(rand(250));# should be different from previous
+     CUL_HM_prtInit ($hash);
+     $hash->{helper}{io}{vccu}    = "";
+-    my @a;
+-    $hash->{helper}{io}{prefIO}  = \@a;
++    #my @a;
++    $hash->{helper}{io}{prefIO}  = undef; #\@a; Beta-User: see noansi version from https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983
+     $hash->{chanNo}              = "01" if (!defined $defs{$HMid."01"}); #readable ref to Channel
+ 
+     if (   !$modules{CUL_HM}{helper}{initDone}
+@@ -658,6 +689,7 @@
+                                                                #         restore is working best, if IOs are defined first in cfg
+         if (defined($restoredIOname)) {
+           $hash->{IODev}                                 = $defs{$restoredIOname};
++          readingsSingleUpdate($hash,'IODev',$restoredIOname,0); # Beta-User: noansi https://forum.fhem.de/index.php/topic,121139.msg1158983.html#msg1158983: first choice with vccu not set
+ #          $attr{$name}{IODev}                            = $restoredIOname;
+           $hash->{helper}{io}{restoredIO}                = $restoredIOname; # noansi: until attributes are filled, this should be the first choice
+           @{$hash->{helper}{mRssi}{io}{$restoredIOname}} = (100,100);       # noansi: set IO high rssi for first autoassign
+@@ -762,7 +794,7 @@
+ sub CUL_HM_Attr(@) {#################################
+   my ($cmd,$name, $attrName,$attrVal) = @_;
+   return undef if (!$init_done);
+-  my $chk = CUL_HM_AttrCheck($name,$cmd, $attrName,$attrVal);
++  my $chk = $cmd eq 'set' ? CUL_HM_AttrCheck($name, $attrName) : '';
+   return $chk if ($chk);
+   my $hash = CUL_HM_name2Hash($name);
+   my $updtReq = 0;
+@@ -799,6 +831,7 @@
+     return $attr{$name}{$attrName} if ($ret);
+   }
+   elsif($attrName eq "readOnly"){#[0,1]
++    return "$attrName: $attrVal not allowed. Should be one of 0,1" if $cmd eq 'set' && ( int $attrVal > 1 || !looks_like_number($attrVal) ); #Beta-User: from noansi 24374
+   }
+   elsif($attrName eq "actCycle"){#"000:00" or 'off'
+     if ($cmd eq "set"){
+@@ -932,6 +965,7 @@
+         $attr{$name}{subType} = "virtual";
+         $attr{$name}{".mId"} = CUL_HM_getmIdFromModel($attrVal);
+         $updtReq = 1;
++        #Beta-User: sonst braucht man nach dem define einen Neustart?
+         CUL_HM_AttrAssign($name);
+         CUL_HM_UpdtCentral($name);
+     }
+@@ -1005,6 +1039,7 @@
+       return 'CUL_HM '.$name.': IOgpr set => ccu to control the IO. Delete attr IOgrp if unwanted'
+              if (AttrVal($name,"IOgrp",undef));
+       if ($attrVal) {
++        #Beta-User: Original ist zu eng, liefert bei CUL&Co keine Treffer. Oder beabsichtigt? https://forum.fhem.de/index.php/topic,122848.msg1173977.html#msg1173977
+         my @IOnames = devspec2array('Clients=.*:CUL_HM:.*');
+         return 'CUL_HM '.$name.': Non suitable IODev '.$attrVal.' specified. Options are: ',join(",",@IOnames)
+             if (!grep /^$attrVal$/,@IOnames);
+@@ -1088,11 +1123,11 @@
+       if ($prefIO){
+         my @ioOpts = split(",",$ioLst);
+         return "$ioCCU not a valid CCU with IOs assigned" if (!scalar @ioOpts);
+-        push @ioOpts, 'none';
++        push @ioOpts, 'none'; #Beta-User: Might fix #2 from https://forum.fhem.de/index.php/topic,123238.msg1178193.html#msg1178193
+         @prefIOarr = split(",",$prefIO);
+         foreach my $pIO (@prefIOarr){
+-          return "$pIO is not allowed in preferred IO list. Leave unassigned or choose one or more of ".join(",",@ioOpts) if(1 != grep m{\A$pIO\z},@ioOpts);
+-          return "'none' may not be used without precedent other IO and has to be last!" if ($prefIO eq 'none' || $prefIO =~ m{\bnone[\b]*.+\z});
++          return "$pIO is not an allowed value for preferred IO list. Leave unassigned or choose one or more of ".join(",",@ioOpts) if(1 != grep m{\A$pIO\z},@ioOpts);
++          return "'none' may not be used without precedent other IO and has to be last!" if $prefIO eq 'none' || $prefIO =~ m{\bnone[\b]*.+\z};
+         }
+       }
+       else{
+@@ -1105,9 +1140,9 @@
+       CUL_HM_assignIO($hash); 
+     }
+     else{ # this is a delete
+-      my @a = ();
++      #my @a = ();
+       $hash->{helper}{io}{vccu}   = "";
+-      $hash->{helper}{io}{prefIO} = \@a;
++      $hash->{helper}{io}{prefIO} = undef; #Beta-User: 
+     }
+   }
+   elsif($attrName eq "autoReadReg"){
+@@ -1134,6 +1169,7 @@
+   }
+   elsif($attrName eq "levelMap" ){
+     if ($cmd eq "set"){
++      return "use $attrName only for channels" if !$hash->{helper}{role}{chn}; #Beta-User: noansi 24374
+       delete $hash->{helper}{lm};
+       foreach (split":",$attrVal){
+         my ($val,$vNm) = split"=",$_;
+@@ -1273,7 +1309,7 @@
+   }
+  
+   CUL_HM_queueUpdtCfg($name) if ($updtReq);
+-  return undef;
++  return;
+ }
+ sub CUL_HM_AttrCheck(@) {############################
+   #verify if attr is applicable
+@@ -1292,8 +1328,12 @@
+   $defs{$name}{'.AttrList'} =~ m/ ?($attrName)(:*)(.*?) /;
+   my ($attrFound,$attrOpt)  = ($1,$3);
+ #  return "$attrName not defined for $name" if (!defined $attrFound); # must not occure - already checked global
+-  return undef if (!$attrOpt || $attrOpt =~ m/^(multiple|textField-)/); # any value allowed
++  #Beta-User: fixes https://forum.fhem.de/index.php/topic,122423.0.html
++  return undef if (!$attrOpt || $attrOpt =~ m/^multiple|textField-/); # any value allowed
+   return undef if(grep/^$attrVal$/,split(",",$attrOpt));   # attrval is valid option
++  #return undef if $attrFound && $attrName eq 'param'; #Beta-User: might "repair" https://forum.fhem.de/index.php/topic,123136.msg1178013.html#msg1178013
++  #return undef if $attrFound && $attrName eq 'tempListTmpl'; #Beta-User: would "repair"  https://forum.fhem.de/index.php/topic,122726.msg1177787.html#msg1177787 - but not helpful, as HMinfo will only use the central file if set!
++  
+   return "value $attrVal not allowed. Choose one of:$attrOpt";
+ }
+ sub CUL_HM_AttrInit($;$) {#############################
+@@ -1410,7 +1450,7 @@
+         $hash->{ModulAttr}{$atDef}{$atTyp} = 1;
+       }
+     }
+-    $hash->{AttrList} = join(" ",sort 
++    $hash->{AttrList} = join(" ",sort #Beta-User: double sorting in map and noDup seems to bind empty preselection for param to VIRTUAL channel (textfield); https://forum.fhem.de/index.php/topic,123136.msg1177100.html#msg1177100
+                                  map{my ($foo) = sort keys %{$hash->{ModulAttr}{$_}}; # use first option
+                                        my $val = $hash->{AttrX}{$foo}{$_};
+                                        $_.($val ? ':'.$val                         # add colon
+@@ -1430,6 +1470,7 @@
+   }
+   return;
+ }
++
+ sub CUL_HM_AttrAssign($) {###########################
+   #define the list of valid attributes per entity
+   #remove attributes that are illegal
+@@ -1437,6 +1478,7 @@
+   my $entH = $defs{$name};
+   my $modH = $modules{CUL_HM};
+   return undef if (!$init_done); # we cannot determine now. if attributes are missing
++  #CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq "" || $defs{$name}->{helper}{cmds}{TmplKey} eq "" || !defined $defs{$name}{helper}{cmds}{cmdList});
+   my   @attrGrp = ('glb'); # global for all CUL_HM
+   push @attrGrp,'dev'         if ($entH->{helper}{role}{dev});
+   push @attrGrp,'devPhy'      if ($entH->{helper}{role}{dev} && !$entH->{helper}{role}{vrt});
+@@ -1546,6 +1588,7 @@
+       if ($hash->{helper}{io}{flgs} & 0x02) { $hash->{helper}{io}{sendWu} = 1;     } #noansi: for CUL
+       else                                  { delete($hash->{helper}{io}{sendWu}); }
+     }
++    CUL_HM_syncIOassign($hash); #Beta-User: noansi 24374: remove assignment from unassigned IOs, as some assign themselfs automatically on just sending a message
+   }
+ }
+ 
+@@ -1559,7 +1602,7 @@
+   my $events = $dev->{CHANGED};
+   return undef if(!$events); # Some previous notify deleted the array.
+   #my $cws = join(";#",@{$dev->{CHANGED}});
+-  my $count;
++  my $count; #Beta-User: Bessere Rückmeldung beim Umbenennen, https://forum.fhem.de/index.php/topic,122552.0.html
+   foreach my $evnt(@{$events}){
+     if($evnt =~ m/^(DELETEATTR)/){
+     }
+@@ -1616,11 +1659,27 @@
+           $count++;
+         }
+       }
+-      return ($count ? "CUL_HM: $count device(s) renamed or attributes changed due to DELETED or RENAMED event"
+-                     : undef);
++      return "CUL_HM: $count device(s) renamed or attributes changed due to DELETED or RENAMED event" if $count;
++      return;
+     }
+-    elsif (!$modules{CUL_HM}{helper}{initDone} && $evnt =~ m/(INITIALIZED|REREADCFG)/){# grep the first initialize
++    elsif (!$modules{CUL_HM}{helper}{initDone} && $evnt =~ m/INITIALIZED|REREADCFG/){# grep the first initialize
++      #Beta-User: Perform HMinfo configCheck if possible, first for real Devices, then for VIRTUALs
++      #Log3(undef,3,"debug: CUL_HM event $evnt");
+       CUL_HM_updateConfig("startUp");
++=pod      
++      my ($hm) = devspec2array("TYPE=HMinfo");
++      if ( defined $hm ) {
++        my @hmdev = devspec2array("TYPE=CUL_HM:FILTER=DEF=......");   # devices only
++        for (@hmdev){   
++          next if AttrVal($_,'model','') =~ m{virtual}i;
++          HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($_),$_)).")\$");
++        }
++        for (@hmdev){
++          next if AttrVal($_,'model','') !~ m{virtual}i;
++          HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($_),$_)).")\$");
++        }
++      }
++=cut
+       InternalTimer(1,"CUL_HM_setupHMLAN", "initHMLAN", 0);#start asap once FHEM is operational
+     }
+ #    elsif($evnt =~ m/(DEFINED)/  ){ Log 1,"Info --- $dev->{NAME} -->$ntfy->{NAME} :  $evnt";}
+@@ -1630,7 +1689,7 @@
+ #    elsif($evnt =~ m/(MODIFIED)/ ){ Log 1,"Info --- $dev->{NAME} -->$ntfy->{NAME} :  $evnt";}
+ #    else                          { Log 1,"Info --- $dev->{NAME} -->$ntfy->{NAME} :  $evnt";}
+ 
+-  }    
++  }
+ 
+   return undef;
+ }
+@@ -1730,6 +1789,8 @@
+     $mh{devH} = CUL_HM_id2Hash($mh{src}); #sourcehash - changed to channel entity
+     $mh{devH}->{IODev} = $iohash;
+     if (!$modules{CUL_HM}{helper}{hmManualOper}){
++      $mh{devH}->{READINGS}{IODev}{VAL} = $mh{ioName}; #Beta-User: noansi 24374
++      $mh{devH}->{READINGS}{IODev}{TIME} = TimeNow(); #dto
+       my $ioOwn = InternalVal($mh{ioName},'owner_CCU','');
+       $defs{$sname}{IODev} = $defs{$mh{ioName}}; 
+       if ($ioOwn) {
+@@ -1739,8 +1800,9 @@
+             && $mh{myRSSI} ne ''
+             && $mh{myRSSI} >= -50) { #noansi: on good rssi set prefered, too
+           $attr{$sname}{IOgrp} .= ':'.$mh{ioName};
+-          my @a = ();
+-          $mh{devH}->{helper}{io}{prefIO} = \@a;
++          #my @a = (); #Beta-User: noansi 24374
++          my @prefio = ($mh{ioName});
++          $mh{devH}->{helper}{io}{prefIO} = @prefio; #\@a;
+         }
+       }
+       else{
+@@ -2319,6 +2381,7 @@
+ 
+       my ($err       ,$ctrlMode  ,$setTemp          ,$bTime,$pTemp,$pStart,$pEnd,$chn,$uk0,$lBat,$actTemp,$vp) = 
+          (hex($mI[3]),undef      ,hex($mI[1].$mI[2]),"-"    ,"-"   ,"-"    ,"-"                             );
++        #(hex($mI[3]),hex($mI[5]),hex($mI[1].$mI[2]),"-"    ,"-"   ,"-"    ,"-"                             );#Beta-User: noansi 24374
+       
+       if($mh{mTp} eq "10"){
+         $chn = "04";#fixed
+@@ -3398,7 +3461,18 @@
+     }
+ 
+     if($ioId eq $mh{dst} && ($mh{mFlgH}&0x20)){  # Send Ack/Nack
+-      push @ack,$mh{shash},$mh{mNo}."8002".$ioId.$mh{src}.($mh{mFlg}.$mh{mTp} eq "A001" ? "80":"00");
++      #push @ack,$mh{shash},$mh{mNo}."8002".$ioId.$mh{src}.($mh{mFlg}.$mh{mTp} eq "A001" ? "80":"00");
++      #Beta-User: noansi 24374 till else-end
++      if ($mh{mFlg}.$mh{mTp} eq 'A001') {
++        push @ack,$mh{shash},$mh{mNo}.'8002'.$ioId.$mh{src}.'80';
++      }
++      else {
++        push @ack,$mh{shash},$mh{mNo}.'8002'.$ioId.$mh{src}.'00'  #noansi: additional CUL ACK
++            if (   $ioId eq $mh{dst}
++                && !$mh{wakupAck} #noansi: not if wakeup is sent
++                && !$mh{devH}->{IODev}->{helper}{VTS_ACK} # for TSCUL VTS0.17 up
++                && $mh{devH}->{IODev}->{TYPE} !~ m/^(?:HMLAN|HMUARTLGW)$/s ); #noansi: additional CUL ACK 
++      }
+     }
+   }
+   elsif($mh{st} eq "threeStateSensor") { ######################################
+@@ -3585,7 +3659,9 @@
+   elsif($ioId eq $mh{dst}){# if fhem is destination check if we need to react
+     if(   $mh{mTp} =~ m/^4./    #Push Button event
+        && !$mh{AckDone}          #noansi: allready done device specific
+-       && ($mh{mFlgH} & 0x20)){  #response required Flag
++       && ($mh{mFlgH} & 0x20)    #response required Flag
++       #&& !$mh{wakupAck}         #Beta-User: noansi 24374: not if wakeup is sent
++       ){
+                 # fhem CUL shall ack a button press
+       if ($mh{md} =~ m/^(HM-SEC-SC.*|ROTO_ZEL-STG-RM-FFK)$/){# SCs - depending on FW version - do not accept ACK only. Especially if peered
+         push @ack,$mh{shash},$mh{mNo}."8002".$mh{dst}.$mh{src}."0101".((hex($mI[0])&1)?"C8":"00")."00";
+@@ -3675,6 +3751,7 @@
+       if    ($rxt & 0x10) { #lazy config device
+         if ($devHlpr->{prt}{sleeping}) {
+           CUL_HM_appFromQ($mhp->{devN},"cf");# stack cmds if waiting
++          #Beta-User: noansi 24374 (some modifications starting from here missing!)
+           if (defined($mhp->{devH}->{helper}{io}{flgs}) && ($mhp->{devH}->{helper}{io}{flgs} & 0x02)) { #noansi: io prepared?
+             if (!(   $mhp->{devH}->{IODev}->{helper}{VTS_LZYCFG} # for TSCUL VTS0.34 up, wakeup Ack was automatically sent
+                   || $mhp->{devH}->{IODev}->{TYPE} =~ m/^(?:HMLAN|HMUARTLGW)$/s )
+@@ -3764,7 +3841,7 @@
+       #82 : peer not accepted - list full (VD)
+       #84 : request undefined register
+       #85 : peer not accepted - why? unknown
+-      
++      #Beta-User: noansi 24374 completely differs in NACK handling...
+       my $lastMsg = "dummy";
+       if($devHlpr->{cSnd}){
+         $lastMsg = $devHlpr->{cSnd};
+@@ -3943,6 +4020,8 @@
+         delete $mhp->{devH}{READINGS}{".RegL_00."};
+         push @evtEt,[$defs{$ioOwn},1,"hmPair:name:$mhp->{devN} SN:".$regser." model:$attr{$mhp->{devN}}{model}"];
+         if (!$modules{CUL_HM}{helper}{hmManualOper}){
++          readingsSingleUpdate($mhp->{devH}, 'IODev', $ioN, 0, TimeNow()); #Beta-User: modified from noansi 24374
++
+           if($ioOwn){
+             $attr{$mhp->{devN}}{IOgrp} = "$ioOwn:$ioHash->{NAME}";
+           }
+@@ -3969,6 +4048,7 @@
+       }
+     }
+     if (!$paired) {
++      #Beta-User: noansi 24374 is completely different here                                         
+       CUL_HM_infoUpdtDevData($mhp->{devN}, $mhp->{devH}, $mhp->{p}, 0)
+                 if (!$modules{CUL_HM}{helper}{hmManualOper});
+       if (CUL_HM_getRxType($mhp->{devH}) & 0x14) {#no pair -send config?
+@@ -4328,6 +4408,7 @@
+   RemoveInternalTimer("updateConfig");
+   InternalTimer(gettimeofday()+5,"CUL_HM_updateConfig", "updateConfig", 0);
+ }
++
+ sub CUL_HM_parseSDteam(@){#handle SD team events
+   my ($mTp,$sId,$dId,$p) = @_;
+   
+@@ -4723,13 +4804,13 @@
+   }
+   elsif($cmd eq "tplInfo"){  ##################################################
+     my $info;
+-    my @tplCmd = split(" ",CUL_HM_TmplSetCmd($name));
++    my @tplCmd = split(" ",CUL_HMTmplSetCmd($name));
+     my %tplH;
+     my %tplTyp = (dev  =>"device templates"
+                  ,ls   =>"templates for peerings serving short OR long press"
+                  ,both =>"templates for peerings serving short AND long press"
+     );
+-    foreach my $tplSet (split(" ",CUL_HM_TmplSetCmd($name))){
++    foreach my $tplSet (split(" ",CUL_HMTmplSetCmd($name))){
+       my ($tplDst,$tplOpt) = split(":",$tplSet);
+       my @tplLst = sort split(",",$tplOpt);
+       if ($tplDst eq "tplSet_0"){#none peer template
+@@ -4804,7 +4885,7 @@
+                keys %defs;
+       my @rl;
+       foreach (@dl){
+-        next if IsIgnored($_) || IsDummy($_);
++        next if IsIgnored($_) || IsDummy($_); #frank: https://forum.fhem.de/index.php/topic,123238.msg1178193.html#msg1178193
+         my(undef,$pref) = split":",$attr{$_}{IOgrp},2;
+         $pref =  "---" if (!$pref);
+         my $IODev = $defs{$_}{IODev}->{NAME}?$defs{$_}{IODev}->{NAME}:"---";
+@@ -4914,7 +4995,7 @@
+ }
+ sub CUL_HM_SetList($$) {#+++++++++++++++++ get command basic list++++++++++++++
+   my($name,$cmdKey)=@_;
+-  my $hash = $defs{$name} // return;
++  my $hash = $defs{$name} // return; #Beta-User: workaround for uninitialized-Problem mentionned in https://forum.fhem.de/index.php/topic,123257.msg1178290.html#msg1178290
+   
+   if(!$cmdKey){
+     my $devName = InternalVal($name,"device",$name);
+@@ -4944,7 +5025,7 @@
+     
+     if( !$roleV &&($roleD || $roleC)        ){push @arr1,map{"$_:".$culHmGlobalSets->{$_}            } sort keys %{$culHmGlobalSets}           };
+     if(( $roleV||!$st||$st eq "no")&& $roleD){push @arr1,map{"$_:".$culHmGlobalSetsVrtDev->{$_}      } sort keys %{$culHmGlobalSetsVrtDev}     };
+-    if( !$roleV                    && $roleD){push @arr1,map{"$_:".${$culHmSubTypeDevSets->{$st}}{$_}} sort keys %{$culHmSubTypeDevSets->{$st}}};
++    if( !$roleV                    && $roleD){push @arr1,map{"$_:".${$culHmSubTypeDevSets->{$st}}{$_}} sort keys %{$culHmSubTypeDevSets->{$st}}}; #Beta-User: sorting keys avoids erratic behaviour wrt. to setters and e.g. tempListTmpl attribute, see https://forum.fhem.de/index.php/topic,122422.msg1176621.html#msg1176621
+     if( !$roleV                    && $roleC){push @arr1,map{"$_:".$culHmGlobalSetsChn->{$_}         } sort keys %{$culHmGlobalSetsChn}        };
+     if( $culHmSubTypeSets->{$st}   && $roleC){push @arr1,map{"$_:".${$culHmSubTypeSets->{$st}}{$_}   } sort keys %{$culHmSubTypeSets->{$st}}   };
+     if( $culHmModelSets->{$md})              {push @arr1,map{"$_:".${$culHmModelSets->{$md}}{$_}     } sort keys %{$culHmModelSets->{$md}}     };
+@@ -5004,10 +5085,10 @@
+   my $tmplAssTs = (defined $hash->{helper}{cmds}{TmplTs} ? $hash->{helper}{cmds}{TmplTs}:"noAssTs");# template assign timestamp
+   my $peerLst = InternalVal($name,"peerList","");
+   if($hash->{helper}{cmds}{TmplKey} ne $peerLst.":$tmplStamp:$tmplAssTs" ){
+-    my @arr1 =  map{"$_:-value-"}split(" ",CUL_HM_TmplSetParam($name));
++    my @arr1 =  map{"$_:-value-"}split(" ",CUL_HMTmplSetParam($name));
+     delete $hash->{helper}{cmds}{cmdLst}{$_} foreach(grep/^tpl(Set|Para)/,keys%{$hash->{helper}{cmds}{cmdLst}});
+     
+-    CUL_HM_TmplSetCmd($name);
++    CUL_HMTmplSetCmd($name);
+     push @arr1, "tplSet_0:-tplChan-" if(defined $hash->{helper}{cmds}{lst}{tplChan});
+     if(defined $hash->{helper}{cmds}{lst}{tplPeer}){
+       push @arr1, "tplSet_$_:-tplPeer-" foreach(split(",",$peerLst));
+@@ -5027,13 +5108,13 @@
+ 
+   return;
+ }
++
+ sub CUL_HM_SearchCmd($$) {#+++++++++++++++++ is command supported?+++++++++++++
+   my($name,$findCmd)=@_;
+-  CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq "");
++  CUL_HM_SetList($name,"") if ($defs{$name}{helper}{cmds}{cmdKey} eq ""); # || $defs{$name}->{helper}{cmds}{TmplKey} eq "" || !defined $defs{$name}{helper}{cmds}{cmdList});
+   return defined $defs{$name}{helper}{cmds}{cmdLst}{$findCmd} ? 1 : 0;
+ }
+ 
+-
+ sub CUL_HM_Set($@) {#+++++++++++++++++ set command+++++++++++++++++++++++++++++
+   my ($hash, @a) = @_;
+ #  my $T0 = gettimeofday();
+@@ -5334,7 +5415,7 @@
+     if ($result){
+       return $result;
+     }
+-    $hash->{device} = $newName;
++    $hash->{device} = $newName; #Beta-User: for deviceRename see https://forum.fhem.de/index.php/topic,123131.0.html
+  
+     if ($roleV){
+       foreach(1..50){
+@@ -5384,8 +5465,10 @@
+     }
+     ($fn,$template) = split(":",($template?$template
+                                           :AttrVal($name,"tempListTmpl",$name)));
++    #if ($modules{HMinfo}){
++    #Beta-User: prevent crash, wenn no HMinfo device is defined
+     if (defined &HMinfo_tempListDefFn){
+-      if (!$template){ $template = HMinfo_tempListDefFn()   .":$fn"      ;}
++       if (!$template){ $template = HMinfo_tempListDefFn()   .":$fn"      ;}
+       else{            $template = HMinfo_tempListDefFn($fn).":$template";}
+     }
+     else{
+@@ -6283,7 +6366,7 @@
+ 
+   elsif($cmd eq "displayWM" ) { ###############################################
+     $state = "";
+-    
++
+     # textNo color icon
+     my $param = (scalar(@a)-2);
+     if ($a[2] eq "help"){
+@@ -7333,7 +7416,7 @@
+     my $serial = ReadingsVal($name, "D-serialNr", AttrVal($name,'serialNr',""));
+     return "serial $serial - wrong length or Reading D-serialNr not present"
+           if(length($serial) != 10);
+-    my ($IO,undef)=split(":",AttrVal("laSwitch","IOgrp",AttrVal("laSwitch","IODev","")));
++    my ($IO,undef)=split(":",AttrVal("laSwitch","IOgrp",AttrVal("laSwitch","IODev",ReadingsVal("laSwitch","IODev",""))));
+     if ($cmd eq "pair"){
+       return "no IO defined - cannot issue command" if (!defined $IO || !defined $defs{$IO} );
+       CUL_HM_Set($defs{$IO},$IO,"hmPairSerial",$serial);
+@@ -7596,6 +7679,7 @@
+       elsif(  ($vc ne "init" && $hashVd->{msgRed} <= $hashVd->{miss})
+             || $hash->{helper}{virtTC} ne "00") {
+         $hashVd->{msgSent} = 1;
++        $defs{$hashVd->{nDev}}->{helper}{prt}{reSent} = 4; #Beta-User: noansi 24374: no repeat wanted, if no answer
+         CUL_HM_SndCmd($defs{$hashVd->{nDev}},sprintf("%02X%s%s%s"
+                                              ,$msgCnt
+                                              ,$hashVd->{cmd}
+@@ -7686,6 +7770,7 @@
+                               ".D-devInfo:$devInfo",
+                               ".D-stc:$stc");
+ }
++
+ sub CUL_HM_updtDeviceModel($$@) {#change the model for a device - obey overwrite modelForce
+   my($name,$model,$fromUpdate) = @_;
+   my $hash = $defs{$name};
+@@ -7699,21 +7784,21 @@
+   my %chanExist;
+   %chanExist = map { $_ => 0 } CUL_HM_getAssChnIds($name);
+   if ($attr{$name}{subType} eq "virtual"){# do not apply all possible channels for virtual
+-    foreach my $chanid (keys %chanExist) {
+-      my $chann = CUL_HM_id2Name($chanid);
+-      next if (!defined $defs{$chann}); #special for ACTIONDETECTOR. Or use "next if ($chanExist{$_} == 1);"
+-      $attr{$chann}{model} = $model;
+-      if ( $fromUpdate && AttrVal($chann,'peerIDs',undef) && !keys %{$defs{$chann}{helper}{peerIDsH}} ) {
+-          CUL_HM_ID2PeerList($chann,$_,1) for ('peerUnread',split q{,},AttrVal($chann,'peerIDs',''));
+-      } #Beta-User: Might not have been called earlier. Then subtype is unknown yet, https://forum.fhem.de/index.php/topic,123136.msg1177303.html#msg1177303;
+-      CUL_HM_SetList($chann,'') if ($fromUpdate || !defined $defs{$chann}{helper}{cmds}{cmdLst});
+-      CUL_HM_AttrAssign($chann) if ($fromUpdate); #Beta-User: add .AttrList for virtual channels
+-      $defs{$chann}->{'.AttrList'} =~ s{IOList |expert[\S]+ |levelRange }{}g if (defined $defs{$chann}->{'.AttrList'});
++    for my $chanid (keys %chanExist) {
++        my $chann = CUL_HM_id2Name($chanid);
++        next if !defined $defs{$chann}; #special for ACTIONDETECTOR. Or use "next if ($chanExist{$_} == 1);"
++        $attr{$chann}{model} = $model; #Beta-User: or 'VIRTUAL'?
++        if ( $fromUpdate && AttrVal($chann,'peerIDs',undef) && !keys %{$defs{$chann}{helper}{peerIDsH}} ) {
++            CUL_HM_ID2PeerList($chann,$_,1) for ('peerUnread',split q{,},AttrVal($chann,'peerIDs',''));
++        } #Beta-User: Might not have been called earlier. Then subtype is unknown yet, https://forum.fhem.de/index.php/topic,123136.msg1177303.html#msg1177303;
++        CUL_HM_SetList($chann,'') if $fromUpdate || !defined $defs{$chann}{helper}{cmds}{cmdLst};
++        CUL_HM_AttrAssign($chann) if $fromUpdate; #Beta-User: add .AttrList for virtual channels
++        $defs{$chann}->{'.AttrList'} =~ s{IOList |expert[\S]+ |levelRange }{}g if defined $defs{$chann}->{'.AttrList'}; #Beta-User: some cleanup, but we may have to delete some more elements...
+     }
+   }
+   else{
+-    CUL_HM_SetList($name,'') if ($fromUpdate || !defined $defs{$name}{helper}{cmds}{cmdLst});
+-    CUL_HM_AttrAssign($name) if ($fromUpdate);
++    CUL_HM_SetList($name,'') if $fromUpdate || !defined $defs{$name}{helper}{cmds}{cmdLst};
++    CUL_HM_AttrAssign($name) if $fromUpdate;
+     my @chanTypesList = split(',',$culHmModel->{$mId}{chn});
+     foreach my $chantype (@chanTypesList){# check all regulat channels
+       my ($chnTpName,$chnStart,$chnEnd) = split(':',$chantype);
+@@ -7731,7 +7816,7 @@
+           $attr{CUL_HM_id2Name($chnId)}{model} = $model ;
+           $chanExist{$chnId} = 1; # mark this channel as required
+         }
+-        CUL_HM_SetList(CUL_HM_id2Name($chnId),"") if ($fromUpdate); #!defined $defs{CUL_HM_id2Name($chnId)}{helper}{cmds}{cmdLst};
++        CUL_HM_SetList(CUL_HM_id2Name($chnId),"") if $fromUpdate; #!defined $defs{CUL_HM_id2Name($chnId)}{helper}{cmds}{cmdLst};
+         CUL_HM_AttrAssign(CUL_HM_id2Name($chnId));
+         $chnNoTyp++;
+       }
+@@ -8130,10 +8215,10 @@
+     elsif($mTp eq '11')                {
+       my $to = "";
+       if ($chn eq "02"){#!!! chn is subtype!!!
+-        if ($dat =~ m/(..)....(....)/){#lvl ne 0 and timer on
++        if ($dat =~ m/^(..)....(....)/){ #lvl ne 0 and timer on #Beta-User: noansi 24374
+           # store Channel in this datafield. 
+           # dimmer may answer with wrong virtual channel - then dont resent!
+-          $hash->{helper}{tmdOn} = $sTp if ($1 ne "00" && $2 !~ m/(0000|FFFF)/);
++          $hash->{helper}{tmdOn} = $sTp if ($1 ne "00" && $2 !~ m/^(0000|FFFF)/); #Beta-User: noansi 24374
+           $to = "timedOn:=1";
+         }
+       }
+@@ -8416,6 +8501,7 @@
+       # device might still be busy with writing flash or similar
+       # we have to wait for next wakeup
+       unshift (@{$hash->{cmdStack}}, "++".substr($pHash->{rspWait}{cmd},6));
++              #if (substr($pHash->{rspWait}{cmd},8,2) ne "58"); #Beta-User: noansi 24374: do not repeat TC duty cycle
+       delete $pHash->{try};
+       CUL_HM_respPendRm($hash);# do not count problems with wakeup try, just wait
+       CUL_HM_protState($hash,"CMDs_pending");
+@@ -8460,7 +8546,7 @@
+         }
+         my $wuReSent = $pHash->{rspWait}{reSent};# save 'invalid' count
+         CUL_HM_respPendRm($hash);#clear
+-        CUL_HM_protState($hash,"CMDs_pending");
++        CUL_HM_protState($hash,"CMDs_pending",1); #Beta-User: noansi 24374: with wakeup prep
+         $pHash->{wuReSent} = $wuReSent;# restore'invalid' count after general delete
+       }
+       else{# normal/burst device resend
+@@ -8661,8 +8747,8 @@
+     CUL_HM_respPendRm($hash);
+   }
+ }
+-sub CUL_HM_protState($$){
+-  my ($hash,$state) = @_;
++sub CUL_HM_protState($$;$){ #Beta-User: noansi 24374 modifications
++  my ($hash,$state,$wakeupPrep) = @_;
+   my $name = $hash->{NAME};
+ 
+   my $sProcIn = $hash->{helper}{prt}{sProc};
+@@ -8680,11 +8766,17 @@
+                             :"");
+     delete($hash->{cmdStack});
+     delete($hash->{protCmdPend});
++    delete($hash->{helper}{io}{supWu}); #Beta-User: noansi 24374
+     $hash->{helper}{prt}{bErr}  = 0;
+     $hash->{helper}{prt}{sProc} = 0;
+     $hash->{helper}{prt}{awake} = 0 if (defined $hash->{helper}{prt}{awake});
++    $wakeupPrep = (   $wakeupPrep #Beta-User: noansi 24374
++                   || (   (   $hash->{helper}{q}{qReqConf}
++                           || $hash->{helper}{q}{qReqStat} )
++                       && CUL_HM_getRxType($hash) & 0x18 ) ); #wakeup prep for wakeup, lazyConfig 
+   }
+   elsif($state eq "Info_Cleared"){
++    delete($hash->{helper}{io}{supWu}); #Beta-User: noansi 24374
+     $hash->{helper}{prt}{sProc} = 0;
+     $hash->{helper}{prt}{awake} = 0 if (defined $hash->{helper}{prt}{awake});
+   }
+@@ -8711,9 +8803,12 @@
+   }
+   Log3 $name,5,"CUL_HM $name protEvent:$state".
+             ($hash->{cmdStack}?" pending:".scalar @{$hash->{cmdStack}}:"");
+-  CUL_HM_hmInitMsgUpdt($hash) if (  $hash->{helper}{prt}{sProc} != $sProcIn
+-                                  && (   $hash->{helper}{prt}{sProc} < 2
+-                                      ||($hash->{helper}{prt}{sProc} == 2 && $sProcIn == 0 )));
++  CUL_HM_hmInitMsgUpdt($hash,$wakeupPrep) 
++        if ( $hash->{helper}{prt}{sProc} #Beta-User: noansi 24373
++             != $sProcIn 
++             && ( $wakeupPrep
++                  || $hash->{helper}{prt}{sProc} < 2
++                  ||($hash->{helper}{prt}{sProc} == 2 && $sProcIn == 0 )));
+ }
+ 
+ ###################-----------helper and shortcuts--------#####################
+@@ -8950,7 +9045,7 @@
+   if ($defs{$name}){
+     push @chnN,$name;
+     my $hash = $defs{$name};
+-    push @chnN,$hash->{$_} foreach (grep /^channel_/,sort keys %{$hash});
++    push @chnN,$hash->{$_} foreach (grep /^channel_/, sort keys %{$hash});
+   }
+   return sort(@chnN);
+ }
+@@ -9311,7 +9406,7 @@
+   }     
+   return $convFlg.$data.$unit;
+ }
+-sub CUL_HM_TmplSetCmd($){
++sub CUL_HMTmplSetCmd($){
+   my $name = shift;
+   return "" if(not scalar devspec2array("TYPE=HMinfo"));
+   my $devId = substr($defs{$name}{DEF},0,6);
+@@ -9327,7 +9422,7 @@
+     $peer = "self".substr($peer,-2) if($peer =~ m/^${name}_chn-..$/);
+     my $ps = $peer eq "0" ? "R-" : "R-$peer-";
+     my %b = map { $_ => 1 }map {(my $foo = $_) =~ s/.?$ps//; $foo;} grep/.?$ps/,keys%{$defs{$name}{READINGS}};
+-    foreach my $t(reverse sort keys %HMConfig::culHmTpl){
++    foreach my $t(reverse sort keys %HMConfig::culHmTpl){ #Beta-User: reverse sorting keys for tempListTmpl attribute, see https://forum.fhem.de/index.php/topic,122422.msg1176621.html#msg1176621
+       next if (not scalar (keys %{$HMConfig::culHmTpl{$t}{reg}}));
+       my $f = 0;
+       my $typShLg=0;
+@@ -9363,7 +9458,7 @@
+                          : "")#no template
+          ;
+ }
+-sub CUL_HM_TmplSetParam($){
++sub CUL_HMTmplSetParam($){
+   my $name = shift;
+   return "" if(not scalar devspec2array("TYPE=HMinfo"));
+   my @tCmd;
+@@ -9488,13 +9583,6 @@
+   $chn = (length($chn) == 8)?substr($chn,6,2):"";
+   my @regArr = CUL_HM_getRegN($st,$md,$chn);
+   my @changedRead;
+-  
+-  
+-  if(  !CUL_HM_getPeers($name,"ID:$peerId") 
+-     && CUL_HM_getPeers($name,"ID:".substr($peerId,0,6))){
+-    ($peerId) = CUL_HM_getPeers($name,"ID:".substr($peerId,0,6));
+-  }
+-
+   my $regLN = ($hash->{helper}{expert}{raw}?"":".")
+               .sprintf("RegL_%02X.",$listNo)
+               .($peerId ? CUL_HM_peerChName($peerId,$devId) : "");
+@@ -9540,6 +9628,7 @@
+ sub CUL_HM_cfgStateDelay($) {#update cfgState: schedule for devices
+   my $name = shift;
+   CUL_HM_cfgStateUpdate("cfgStateUpdate:".CUL_HM_getDeviceName($name));
++  #Beta-User: noansi 2374 proposal: enhance delay every time this is called                                 
+ }
+ sub CUL_HM_cfgStateUpdate($) {#update cfgState
+   my $tmrId = shift;
+@@ -9553,9 +9642,9 @@
+     my ($hm) = devspec2array("TYPE=HMinfo");
+     HMinfo_GetFn($defs{$hm},$hm,"configCheck","-f","^(".join("|",(CUL_HM_getAssChnNames($name),$name)).")\$") if (defined $hm);
+   }
+-  else {
++  else { 
+     $defs{$name}{helper}{cfgStateUpdt} = 1;  # use to remove duplicate timer                                                                       
+-    InternalTimer(gettimeofday() + 60, "CUL_HM_cfgStateUpdate","cfgStateUpdate:$name", 0) if ($init_done || length(CUL_HM_name2Id($name)) == 6); # try later
++    InternalTimer(gettimeofday() + 60, "CUL_HM_cfgStateUpdate","cfgStateUpdate:$name", 0) if $init_done || length(CUL_HM_name2Id($name)) == 6; # try later; #Beta-User: but only for main device if called before init_done
+   }
+   return;
+ }
+@@ -10663,7 +10752,8 @@
+ }
+ sub CUL_HM_noDup(@) {#return list with no duplicates
+   my %all;
+-  return @_ if (!scalar(@_));
++  #return "" if (scalar(@_) == 0); #martinp876: @Ansgar: noDup muss ich noch untersuchen. Wird häufig benötigt...
++  return @_ if (!scalar(@_)); #noansi: return empty array instead of empty string, https://forum.fhem.de/index.php/topic,122107.msg1168262.html#msg1168262
+   $all{$_}=0 foreach (grep {defined $_ && $_ !~ m/^$/} @_);
+   delete $all{""}; #remove empties if present
+   return (sort keys %all);
+@@ -10759,6 +10849,7 @@
+                        ,sort map{"IO:$_"} split(",",AttrVal($name,"IOList",""))
+                        ,sort devspec2array("TYPE=CUL_HM:FILTER=IOgrp=$name.*") # devices assigned to the vccu
+                    )." ";
++  #$defs{$name}{'.AttrList'}    =~ s/logIDs:.*? /$logOpt/;
+   if ( defined $defs{$name}{'.AttrList'} ) { #Beta-User: fixes "uninitialized ... in substitution" warning at startup
+       $defs{$name}{'.AttrList'} =~ s/logIDs:.*? /$logOpt/;
+   } else {
+@@ -10787,6 +10878,7 @@
+ }
+ sub CUL_HM_UpdtCentralState($){
+   my $name = shift;
++  return if !$defs{$name}; #Beta-User: noansi 24374 proposal
+   my $state = "";
+   my @IOl = split",",AttrVal($name,"IOList","");
+   foreach my $e (split",",$defs{$name}{assignedIOs}){
+@@ -10853,7 +10945,11 @@
+   
+   my $hash = shift;
+   
+-  my $oldIODevH = $hash->{IODev};
++  #Beta-User lot of differing details to noansi 24374
++  #my $oldIODevH = $hash->{IODev}; #Beta-User: noansi 24374 proposal
++  my $oldIODevH = $modules{CUL_HM}{helper}{initDone} ?
++                     CUL_HM_operIObyIOHash($hash->{IODev})
++                   : undef; #noansi: during FHEM init device is not correctly assigned to IO, force a set
+   my $hh = $hash->{helper};
+ 
+   return 0 if (   (   defined($hh->{prt}{sProc})
+@@ -10872,7 +10968,8 @@
+       ($iom) =    ((sort {@{$hh->{mRssi}{io}{$b}}[0] <=>     # This is the best choice
+                             @{$hh->{mRssi}{io}{$a}}[0] } 
+                           (grep { defined @{$hh->{mRssi}{io}{$_}}[0]} @ioccu))
+-                         ,(grep {!defined @{$hh->{mRssi}{io}{$_}}[0]} @ioccu))      if(@ioccu);
++                         ,(grep {!defined @{$hh->{mRssi}{io}{$_}}
++                         [0]} @ioccu))      if(@ioccu);
+     } 
+     ($iom) = grep{defined $defs{$_}} @{$hh->{io}{prefIO}}                           if(!$iom && @{$hh->{io}{prefIO}});
+     ($iom) = grep{defined $defs{$_}} @{$defs{$hh->{io}{vccu}}{helper}{io}{ioList}}  if(!$iom && @{$defs{$hh->{io}{vccu}}{helper}{io}{ioList}});
+@@ -10896,10 +10993,9 @@
+   }
+ 
+   my $result = 0; # default: IO unchanged
+-  if(  (defined $newIODevH && (!defined($oldIODevH) || $newIODevH ne $oldIODevH))){
++  if(  (defined $newIODevH && (!defined($oldIODevH) || $newIODevH ne $oldIODevH))){ #Beta-User: nummeric comparison might be wrong?
+     my $ID = CUL_HM_hash2Id($hash);
+-    IOWrite($hash, "", "remove:".$ID) if(   defined($oldIODevH) && defined $oldIODevH->{NAME} 
+-                                         && $oldIODevH->{TYPE}  && $oldIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/); #IODev still old
++    IOWrite($hash, "", "remove:".$ID) if(defined($oldIODevH) && defined $oldIODevH->{NAME} && $oldIODevH->{TYPE} && $oldIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/); #IODev still old #Beta-User: might prevent log entries for CUL Type IO's
+     AssignIoPort($hash,$newIODevH->{NAME}); #  send preferred
+     $hash->{IODev} = $newIODevH;
+     if (   ($newIODevH->{TYPE} && $newIODevH->{TYPE} =~ m/^(HMLAN|HMUARTLGW)$/)
+@@ -10964,6 +11060,38 @@
+   return $result;
+ }
+ 
++#Beta-User: new function proposed by noansi in 24374
++sub CUL_HM_syncIOassign($){ #remove assignment from all unassigned IOs
++  my $hash = shift;
++  my $hh = $hash->{helper};
++
++  my $ioVCCU  = $hash->{helper}{io}{vccu};
++  if (   $ioVCCU
++      && defined($defs{$ioVCCU})
++      && ref($defs{$ioVCCU}{helper}{io}{ioList}) eq 'ARRAY' ) {
++    my $ID = CUL_HM_hash2Id($hash);
++    my $currioH = $hash->{IODev};
++    my $lIODevH;
++    for my $ioLd (@{$defs{$ioVCCU}{helper}{io}{ioList}}) { # noansi: remove on all unassigned IOs to ensure a consistant state of assignments in IO devices!
++                                                           #         IO has to keep track about and really remove just if required
++      $lIODevH = $defs{$ioLd};
++      next if (   !defined($lIODevH)
++               || ($lIODevH == $currioH) );
++      if (ReadingsVal($ioLd,'state','') ne 'disconnected') {
++        if (   $lIODevH->{TYPE} =~ m/^HM(?:LAN|UARTLGW)$/s #if this unselected IO is HMLAN/HMUARTLGW we have to remove the device from IO
++#            || $lIODevH->{helper}{VTS_AES} #if this unselected IO is TSCUL 0.14+ we have to remove the device from IO, as it starts with "historical" assignment data
++            ) {
++          $hash->{IODev} = $lIODevH; # temporary assignment for IOWrite to work on each IO!
++          IOWrite($hash, '', 'remove:'.$ID);
++        }
++      }
++    }
++    $hash->{IODev} = $currioH; # set IO again
++  }
++
++  return;
++}
++
+ sub CUL_HM_stateUpdatDly($$){#delayed queue of status-request
+   my ($name,$time) = @_;
+   CUL_HM_unQEntity($name,"qReqStat");#remove requests, wait for me.
+@@ -11340,6 +11468,7 @@
+     $modules{CUL_HM}{helper}{cfgCmpl}{$name} = 1;#mark config as complete
+   }
+ }
++
+ sub CUL_HM_configUpdate($)   {# mark entities with changed data for archive
+   my $name = shift;
+   $modules{CUL_HM}{helper}{confUpdt}{$name} = 1;
+@@ -12195,7 +12324,7 @@
+                simulates the humidity part of a thermostat. If peered to a device it periodically sends 
+                the temperature and humidity until both are "off". See also <a href="#CUL_HM-set-virtTemp">virtTemp</a><br>
+              </li>
+-             <li><B>valvePos &lt;[off 0..100]&gt;<a id="CUL_HM-set-valvePos"></a></B>
++             <li><a id="CUL_HM-set-valvePos"></a><B>valvePos &lt;[off 0..100]&gt;</B>
+                stimulates a VD<br>
+              </li>
+            </ul>
+@@ -13659,7 +13788,7 @@
+               Simuliert den Feuchtigkeitswert eines Thermostats. Wenn mit einem Ger&auml;t verkn&uuml;pft werden periodisch
+               Luftfeuchtigkeit undTemperatur gesendet, solange bis "off" gew&auml;hlt wird. Siehe auch <a href="#CUL_HM-set-virtTemp">virtTemp</a><br>
+             </li>
+-            <li><B>valvePos &lt;[off 0..100]&gt;<a id="CUL_HM-set-valvePos"></a></B>
++            <li><a id="CUL_HM-set-valvePos"></a><B>valvePos &lt;[off 0..100]&gt;</B>
+               steuert einen Ventilantrieb<br>
+             </li>
+           </ul>
